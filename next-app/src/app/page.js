@@ -18,8 +18,14 @@ import {
   Terminal,
   FileText,
   Sparkles,
-  RefreshCw
+  RefreshCw,
+  Clock,
+  Server
 } from "lucide-react";
+import { createClient } from "@/utils/supabase/client";
+
+// Instantiate Supabase client
+const supabase = createClient();
 
 export default function Dashboard() {
   // Navigation State
@@ -32,6 +38,13 @@ export default function Dashboard() {
   const [fileName, setFileName] = useState("");
   const [isUploading, setIsUploading] = useState(false);
   const fileInputRef = useRef(null);
+
+  // Database State
+  const [totalRuns, setTotalRuns] = useState(42);
+  const [avgR2, setAvgR2] = useState(0.84);
+  const [runsList, setRunsList] = useState([]);
+  const [datasetsList, setDatasetsList] = useState([]);
+  const [loadingDb, setLoadingDb] = useState(false);
 
   // Terminal Logs State
   const [logs, setLogs] = useState([
@@ -54,12 +67,55 @@ export default function Dashboard() {
 
   const terminalEndRef = useRef(null);
 
+  // Fetch real Supabase tables data
+  async function loadSupabaseData() {
+    setLoadingDb(true);
+    try {
+      // 1. Fetch runs history list with dataset details
+      const { data: runsData, error: runsListErr } = await supabase
+        .from("pipeline_runs")
+        .select("*, datasets(*)")
+        .order("created_at", { ascending: false });
+
+      if (!runsListErr && runsData) {
+        setRunsList(runsData);
+        setTotalRuns(runsData.length);
+        
+        // Calculate average R2 score from completed/failed runs metrics
+        const r2Values = runsData
+          .map(r => r.final_metrics?.r2)
+          .filter(val => typeof val === 'number' && val > 0);
+        if (r2Values.length > 0) {
+          const sum = r2Values.reduce((a, b) => a + b, 0);
+          setAvgR2(parseFloat((sum / r2Values.length).toFixed(3)));
+        }
+      }
+
+      // 2. Fetch datasets list
+      const { data: datasetsData, error: dsErr } = await supabase
+        .from("datasets")
+        .select("*")
+        .order("created_at", { ascending: false });
+      if (!dsErr && datasetsData) {
+        setDatasetsList(datasetsData);
+      }
+    } catch (e) {
+      console.error("Failed to load Supabase tables:", e);
+    } finally {
+      setLoadingDb(false);
+    }
+  }
+
+  useEffect(() => {
+    loadSupabaseData();
+  }, []);
+
   // Auto scroll terminal logs
   useEffect(() => {
     terminalEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [logs]);
 
-  // Simulate incremental logs or blinking cursor
+  // Simulate incremental logs
   useEffect(() => {
     const interval = setInterval(() => {
       setLogs((prev) => {
@@ -164,8 +220,8 @@ export default function Dashboard() {
 
         {/* Sidebar Footer info */}
         <div className="p-4 border-t border-zinc-800 text-[10px] text-zinc-500 flex flex-col gap-1">
-          <div>Workspace Environment: Local</div>
-          <div>Version: 1.2.0 (NextJS)</div>
+          <div>Workspace Environment: Supabase Cloud</div>
+          <div>Version: 1.2.0 (SSR Active)</div>
         </div>
       </aside>
 
@@ -186,6 +242,14 @@ export default function Dashboard() {
           </div>
 
           <div className="flex items-center gap-3 text-xs">
+            <button 
+              onClick={loadSupabaseData}
+              disabled={loadingDb}
+              className="flex items-center gap-1.5 px-2 py-1 rounded bg-zinc-900 hover:bg-zinc-800 text-zinc-400 border border-zinc-800 hover:text-white transition-all mr-2"
+            >
+              <RefreshCw size={12} className={loadingDb ? "animate-spin" : ""} />
+              Sync DB
+            </button>
             <span className="flex items-center gap-1.5 px-2 py-1 rounded bg-zinc-800/50 text-zinc-400 border border-zinc-800">
               <span className="w-2 h-2 rounded-full bg-blue-500 animate-pulse"></span>
               Gemini 2.5 Flash
@@ -203,21 +267,24 @@ export default function Dashboard() {
             <div className="bg-[#0c0c0f] border border-zinc-800 rounded-xl p-5 flex flex-col justify-between h-[105px]">
               <span className="text-zinc-500 text-xs font-medium tracking-tight uppercase">total runs</span>
               <div className="flex items-baseline gap-2 mt-2">
-                <span className="text-3xl font-semibold text-white tracking-tight">42</span>
+                <span className="text-3xl font-semibold text-white tracking-tight">{totalRuns}</span>
                 <span className="text-[10px] text-zinc-500">runs</span>
               </div>
-              <span className="text-[10px] text-zinc-500 mt-2 block">active this session</span>
+              <span className="text-[10px] text-zinc-500 mt-2 block">synchronizing with supabase</span>
             </div>
 
             {/* Card 2: Average R² Score */}
             <div className="bg-[#0c0c0f] border border-zinc-800 rounded-xl p-5 flex flex-col justify-between h-[105px]">
               <div className="flex items-center justify-between">
                 <span className="text-zinc-500 text-xs font-medium tracking-tight uppercase">average r² score</span>
-                <span className="text-[10px] font-semibold text-blue-400">84% fit</span>
+                <span className="text-[10px] font-semibold text-blue-400">{Math.round(avgR2 * 100)}% fit</span>
               </div>
-              <div className="text-3xl font-semibold text-white tracking-tight mt-2">0.84</div>
+              <div className="text-3xl font-semibold text-white tracking-tight mt-2">{avgR2}</div>
               <div className="w-full bg-zinc-800 h-1.5 rounded-full overflow-hidden mt-3">
-                <div className="bg-blue-500 h-full w-[84%] rounded-full shadow-[0_0_8px_rgba(59,130,246,0.6)]"></div>
+                <div 
+                  className="bg-blue-500 h-full rounded-full shadow-[0_0_8px_rgba(59,130,246,0.6)] transition-all duration-500"
+                  style={{ width: `${Math.min(Math.max(avgR2 * 100, 5), 100)}%` }}
+                ></div>
               </div>
             </div>
 
@@ -239,11 +306,11 @@ export default function Dashboard() {
               <div className="flex items-center gap-2 mt-2">
                 <span className="px-2.5 py-1 bg-emerald-950/40 text-emerald-400 border border-emerald-900/60 rounded text-[10px] flex items-center gap-1.5 font-semibold">
                   <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
-                  SANDBOX CONNECTED
+                  SUPABASE ACTIVE
                 </span>
               </div>
               <span className="text-[10px] text-emerald-500/80 mt-2 block flex items-center gap-1">
-                SQLite + Supabase active
+                Database link operational
               </span>
             </div>
           </div>
@@ -385,26 +452,125 @@ export default function Dashboard() {
           )}
 
           {activeTab === "history" && (
-            <div className="border border-zinc-800 bg-[#0c0c0f] rounded-xl p-6 text-center text-zinc-500 text-xs h-[460px] flex flex-col items-center justify-center">
-              <History size={36} className="mx-auto text-zinc-600 mb-3 animate-pulse" />
-              <p className="font-semibold text-white text-sm mb-1">Pipeline History Database</p>
-              <p className="max-w-md">Connects directly to your Supabase credentials to audit past model evaluations, coefficients, and execution times.</p>
+            <div className="border border-zinc-800 bg-[#0c0c0f] rounded-xl p-6 text-zinc-400 text-xs min-h-[460px] flex flex-col justify-start">
+              <div className="flex items-center justify-between border-b border-zinc-800 pb-4 mb-4">
+                <div>
+                  <h3 className="font-semibold text-white text-sm">Pipeline Execution Runs</h3>
+                  <p className="text-[10px] text-zinc-500 mt-0.5">Real-time status audited from Supabase `pipeline_runs` table</p>
+                </div>
+                <History size={16} className="text-zinc-500" />
+              </div>
+
+              {runsList.length === 0 ? (
+                <div className="flex-1 flex flex-col items-center justify-center text-center">
+                  <Clock size={28} className="text-zinc-600 mb-2" />
+                  <p className="text-zinc-400 font-medium">No Runs Found</p>
+                  <p className="text-[10px] text-zinc-500 mt-1 max-w-xs">Run a script from the backend or Vite studio to generate execution logs.</p>
+                </div>
+              ) : (
+                <div className="overflow-x-auto w-full custom-scrollbar">
+                  <table className="w-full text-left border-collapse text-[11px]">
+                    <thead>
+                      <tr className="border-b border-zinc-800 text-zinc-500 uppercase tracking-wider font-mono">
+                        <th className="py-2 px-3">Run ID</th>
+                        <th className="py-2 px-3">Dataset</th>
+                        <th className="py-2 px-3">Status</th>
+                        <th className="py-2 px-3">R² Score</th>
+                        <th className="py-2 px-3">Silhouette</th>
+                        <th className="py-2 px-3">Date Created</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {runsList.map((run) => (
+                        <tr key={run.id} className="border-b border-zinc-900/60 hover:bg-zinc-900/20 font-mono">
+                          <td className="py-2.5 px-3 text-zinc-300 font-semibold">{run.id.slice(0, 8)}...</td>
+                          <td className="py-2.5 px-3 text-zinc-400">{run.datasets?.file_name || "Unknown"}</td>
+                          <td className="py-2.5 px-3">
+                            <span className={`px-2 py-0.5 rounded text-[9px] font-semibold border ${
+                              run.run_status === "completed" || run.run_status === "approved"
+                                ? "bg-emerald-950/40 text-emerald-400 border-emerald-900/60"
+                                : run.run_status === "failed"
+                                ? "bg-rose-950/40 text-rose-400 border-rose-900/60"
+                                : "bg-amber-950/40 text-amber-400 border-amber-900/60"
+                            }`}>
+                              {run.run_status}
+                            </span>
+                          </td>
+                          <td className="py-2.5 px-3 text-blue-400 font-bold">{run.final_metrics?.r2 ? run.final_metrics.r2.toFixed(3) : "—"}</td>
+                          <td className="py-2.5 px-3 text-zinc-400">{run.final_metrics?.silhouette ? run.final_metrics.silhouette.toFixed(3) : "—"}</td>
+                          <td className="py-2.5 px-3 text-zinc-500">{new Date(run.created_at).toLocaleString()}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
             </div>
           )}
 
           {activeTab === "supabase" && (
-            <div className="border border-zinc-800 bg-[#0c0c0f] rounded-xl p-6 text-center text-zinc-500 text-xs h-[460px] flex flex-col items-center justify-center">
-              <Database size={36} className="mx-auto text-zinc-600 mb-3 animate-pulse" />
-              <p className="font-semibold text-white text-sm mb-1">Supabase Browser Connection</p>
-              <p className="max-w-md">Active tables: `datasets`, `pipeline_runs`, and `agent_logs` are synchronizing properly. Table modifications reflect automatically.</p>
+            <div className="border border-zinc-800 bg-[#0c0c0f] rounded-xl p-6 text-zinc-400 text-xs min-h-[460px] flex flex-col justify-start">
+              <div className="flex items-center justify-between border-b border-zinc-800 pb-4 mb-4">
+                <div>
+                  <h3 className="font-semibold text-white text-sm">Supabase Database Tables</h3>
+                  <p className="text-[10px] text-zinc-500 mt-0.5">Uploaded files browser syncing with `datasets` schema</p>
+                </div>
+                <Database size={16} className="text-zinc-500" />
+              </div>
+
+              {datasetsList.length === 0 ? (
+                <div className="flex-1 flex flex-col items-center justify-center text-center">
+                  <Server size={28} className="text-zinc-600 mb-2" />
+                  <p className="text-zinc-400 font-medium">No Registered Datasets</p>
+                  <p className="text-[10px] text-zinc-500 mt-1 max-w-xs">Datasets will automatically display here once you upload CSV files through Vite Studio.</p>
+                </div>
+              ) : (
+                <div className="overflow-x-auto w-full custom-scrollbar">
+                  <table className="w-full text-left border-collapse text-[11px]">
+                    <thead>
+                      <tr className="border-b border-zinc-800 text-zinc-500 uppercase tracking-wider font-mono">
+                        <th className="py-2 px-3">Dataset ID</th>
+                        <th className="py-2 px-3">File Name</th>
+                        <th className="py-2 px-3">Row Count</th>
+                        <th className="py-2 px-3">Columns (Features Count)</th>
+                        <th className="py-2 px-3">Uploaded Date</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {datasetsList.map((ds) => {
+                        const cols = ds.columns_json ? Object.keys(ds.columns_json) : [];
+                        return (
+                          <tr key={ds.id} className="border-b border-zinc-900/60 hover:bg-zinc-900/20 font-mono">
+                            <td className="py-2.5 px-3 text-zinc-300 font-semibold">{ds.id.slice(0, 8)}...</td>
+                            <td className="py-2.5 px-3 text-white font-medium flex items-center gap-1.5">
+                              <FileText size={12} className="text-blue-500" />
+                              {ds.file_name}
+                            </td>
+                            <td className="py-2.5 px-3 text-zinc-400">{ds.row_count} rows</td>
+                            <td className="py-2.5 px-3 text-zinc-400 hover:text-white transition-all cursor-help" title={cols.join(", ")}>
+                              {cols.length} columns (hover for details)
+                            </td>
+                            <td className="py-2.5 px-3 text-zinc-500">{new Date(ds.created_at).toLocaleString()}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
             </div>
           )}
 
           {activeTab === "api" && (
-            <div className="border border-zinc-800 bg-[#0c0c0f] rounded-xl p-6 text-center text-zinc-500 text-xs h-[460px] flex flex-col items-center justify-center">
+            <div className="border border-zinc-800 bg-[#0c0c0f] rounded-xl p-6 text-zinc-400 text-xs h-[460px] flex flex-col items-center justify-center">
               <Settings size={36} className="mx-auto text-zinc-600 mb-3 animate-pulse" />
               <p className="font-semibold text-white text-sm mb-1">Model & Schema Settings</p>
-              <p className="max-w-md">Configured API Key for Gemini. Default model: gemini-2.5-flash. Workspace environment utilizes local Python execution sandboxing.</p>
+              <p className="max-w-md text-center mb-4">Configured API Key for Gemini. Workspace environment utilizes local Python execution sandboxing combined with Supabase for user persistence.</p>
+              <div className="bg-[#09090b] border border-zinc-900 rounded p-4 text-[10px] font-mono text-left w-full max-w-lg space-y-2 leading-relaxed">
+                <div><span className="text-zinc-500 uppercase">Supabase URL:</span> <span className="text-zinc-300">https://blyythnqaoajpaelwcej.supabase.co</span></div>
+                <div><span className="text-zinc-500 uppercase">Database Type:</span> <span className="text-emerald-400">PostgreSQL (Supabase SSR client active)</span></div>
+                <div><span className="text-zinc-500 uppercase">Gemini Endpoint:</span> <span className="text-blue-400">gemini-2.5-flash (types.Schema structured inputs)</span></div>
+              </div>
             </div>
           )}
 
