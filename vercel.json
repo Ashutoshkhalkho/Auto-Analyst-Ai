@@ -1,5 +1,21 @@
 {
-  "buildCommand": "npm run build --prefix next-app",
-  "outputDirectory": "next-app/.next",
-  "installCommand": "npm install --prefix next-app"
+  "version": 2,
+  "services": {
+    "frontend": {
+      "path": "frontend"
+    },
+    "backend": {
+      "path": "backend"
+    }
+  },
+  "routes": [
+    {
+      "src": "/api/(.*)",
+      "dest": "/backend/api/$1"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "/frontend/$1"
+    }
+  ]
 }
