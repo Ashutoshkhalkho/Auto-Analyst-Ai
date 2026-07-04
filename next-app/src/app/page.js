@@ -45,12 +45,15 @@ export default function Dashboard() {
   const terminalEndRef = useRef(null);
   const wsRef = useRef(null);
 
+  // Dynamic API URL for Vercel cloud deployments (falls back to local backend)
+  const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
   // Sync DB records on startup
   const [dbStatus, setDbStatus] = useState("connecting");
 
   useEffect(() => {
     // Check backend connection on mount
-    fetch("http://localhost:8000/api/health")
+    fetch(`${API_URL}/api/health`)
       .then((res) => res.json())
       .then((data) => {
         setDbStatus(data.database_type === "Supabase" ? "supabase connected" : "sqlite active");
@@ -58,7 +61,7 @@ export default function Dashboard() {
       })
       .catch((e) => {
         setDbStatus("backend offline");
-        addLog("SYSTEM", "Warning: Could not link to backend server on port 8000.");
+        addLog("SYSTEM", `Warning: Could not link to backend server at ${API_URL}`);
       });
   }, []);
 
@@ -85,7 +88,7 @@ export default function Dashboard() {
     formData.append("file", file);
 
     try {
-      const response = await fetch("http://localhost:8000/api/upload", {
+      const response = await fetch(`${API_URL}/api/upload`, {
         method: "POST",
         body: formData
       });
@@ -128,7 +131,7 @@ export default function Dashboard() {
     setReport("");
 
     try {
-      const response = await fetch("http://localhost:8000/api/start-pipeline", {
+      const response = await fetch(`${API_URL}/api/start-pipeline`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -155,7 +158,9 @@ export default function Dashboard() {
 
   // Connect WebSocket to stream logs
   const connectWebSocket = (id) => {
-    const ws = new WebSocket(`ws://localhost:8000/ws/pipeline/${id}`);
+    const wsProtocol = API_URL.startsWith("https") ? "wss" : "ws";
+    const wsHost = API_URL.replace("http://", "").replace("https://", "");
+    const ws = new WebSocket(`${wsProtocol}://${wsHost}/ws/pipeline/${id}`);
     wsRef.current = ws;
 
     ws.onopen = () => {
