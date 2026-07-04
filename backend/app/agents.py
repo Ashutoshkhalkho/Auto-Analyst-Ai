@@ -12,7 +12,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 HAS_API_KEY = bool(GEMINI_API_KEY)
 
 # Use gemini-1.5-flash as the default model (works on all developer API keys)
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 # Define Pydantic response models for standard typing in python functions
 class CodeAgentResponse(BaseModel):
@@ -21,8 +21,8 @@ class CodeAgentResponse(BaseModel):
 
 class JudgeAgentResponse(BaseModel):
     approved: bool = Field(description="Whether the modeling results satisfy the statistical guidelines.")
-    critique: str = Field(description="Detailed evaluation of R2, coefficients, multicollinearity VIFs, and cluster silhouette scores.")
-    suggested_overrides: dict = Field(default_factory=dict, description="A dictionary of keys: 'drop_features' (list of strings to drop), 'k_clusters' (int), or 'add_polynomials' (bool).")
+    critique: str = Field(description="Detailed evaluation of R2, VIF values, and code safety checks.")
+    suggested_overrides: dict = Field(default_factory=dict, description="A dictionary of keys: 'drop_features' (list of strings to drop), 'syntax_error' (bool), or 'traceback' (str).")
 
 class WriterAgentResponse(BaseModel):
     markdown_report: str = Field(description="A highly structured, premium business markdown report.")
@@ -48,15 +48,15 @@ judge_agent_schema = types.Schema(
     properties={
         "approved": types.Schema(
             type=types.Type.BOOLEAN,
-            description="Whether the modeling results satisfy the statistical guidelines (R2 >= 0.50, no severe multicollinearity)."
+            description="Whether the modeling results satisfy the statistical guidelines (R2 >= 0.60, VIFs <= 5.0, no syntax errors)."
         ),
         "critique": types.Schema(
             type=types.Type.STRING,
-            description="Detailed evaluation of R2, coefficients, multicollinearity VIFs, and cluster silhouette scores."
+            description="Detailed evaluation of R2, VIF values, and visual code safety checks."
         ),
         "suggested_overrides": types.Schema(
             type=types.Type.OBJECT,
-            description="A dictionary of keys: 'drop_features' (array of strings to drop), 'k_clusters' (integer)."
+            description="A dictionary of overrides. Example: {'drop_features': ['visits'], 'syntax_error': false}"
         )
     },
     required=["approved", "critique", "suggested_overrides"]
@@ -80,7 +80,7 @@ def get_genai_client():
 
 # Mock generators for local testing without API keys
 
-def get_mock_data_prep_code(columns_info, drop_features=None):
+def get_mock_data_prep_code(columns_info, drop_features=None, refinement_prompt=None):
     drop_features = drop_features or []
     numeric_cols = [c for c, t in columns_info.items() if t in ("float64", "int64") and c not in drop_features]
     cat_cols = [c for c, t in columns_info.items() if t not in ("float64", "int64") and c not in drop_features]
@@ -136,7 +136,7 @@ print(f"Saved cleaned dataset with shape {{df.shape}} to cleaned_dataset.csv")
         code=code
     )
 
-def get_mock_modeling_code(features, target_col, k_clusters=3, drop_features=None):
+def get_mock_modeling_code(features, target_col, k_clusters=3, drop_features=None, refinement_prompt=None):
     drop_features = drop_features or []
     features = [f for f in features if f != target_col and f not in drop_features]
     
@@ -171,22 +171,33 @@ if target in df.columns and len(reg_features) > 0:
     y_pred = model.predict(X)
     r2 = r2_score(y, y_pred)
     
-    corr = X.corr().abs()
-    high_corr_pairs = []
-    for i in range(len(corr.columns)):
-        for j in range(i):
-            if corr.iloc[i, j] > 0.7:
-                high_corr_pairs.append((corr.columns[i], corr.columns[j], float(corr.iloc[i, j])))
-                
+    # Calculate Variance Inflation Factors (VIFs) using Linear Regression
+    vifs = {{}}
+    multicollinear_warnings = []
+    for col in reg_features:
+        cols_except_col = [c for c in reg_features if c != col]
+        if len(cols_except_col) > 0:
+            r_model = LinearRegression()
+            r_model.fit(X[cols_except_col], X[col])
+            r2_j = r_model.score(X[cols_except_col], X[col])
+            vif = 1.0 / (1.0 - r2_j) if r2_j < 1.0 else 999.0
+            vifs[col] = float(vif)
+            if vif > 5.0:
+                multicollinear_warnings.append(col)
+        else:
+            vifs[col] = 1.0
+            
     coefficients = dict(zip(reg_features, [float(c) for c in model.coef_]))
     
     results["r2"] = float(r2)
     results["coefficients"] = coefficients
     results["intercept"] = float(model.intercept_)
-    results["multicollinear_warnings"] = high_corr_pairs
+    results["vifs"] = vifs
+    results["multicollinear_warnings"] = [[col, "VIF", vifs[col]] for col in multicollinear_warnings]
     
     print(f"Linear Regression R2 Score: {{r2:.4f}}")
     print(f"Coefficients: {{coefficients}}")
+    print(f"Calculated VIFs: {{vifs}}")
     
     plt.figure()
     plt.scatter(y_pred, y - y_pred, alpha=0.5)
@@ -200,6 +211,7 @@ else:
     results["r2"] = 0.0
     results["coefficients"] = {{}}
     results["intercept"] = 0.0
+    results["vifs"] = {{}}
     results["multicollinear_warnings"] = []
 
 # 2. K-Means Clustering
@@ -236,15 +248,15 @@ with open("metrics.json", "w") as f:
 print("Saved model metrics to metrics.json")
 """
     return CodeAgentResponse(
-        explanation="**Local Modeling Engine (Fallback)**: Fits a Multiple Linear Regression model predicting target from numeric features. Computes coefficients, residual plots, and correlation checks. Concurrently trains a K-Means clustering model and evaluates Silhouette metric.",
+        explanation="**Local Modeling Engine (Fallback)**: Fits a Multiple Linear Regression model predicting target from numeric features. Computes VIFs to guard against multicollinearity (>5.0). Concurrently trains a K-Means clustering model.",
         code=code
     )
 
 # Real LLM Agent Invocations
 
-def run_data_prep_agent(file_name: str, row_count: int, columns_info: dict, drop_features=None) -> CodeAgentResponse:
+def run_data_prep_agent(file_name: str, row_count: int, columns_info: dict, drop_features=None, refinement_prompt=None) -> CodeAgentResponse:
     if not HAS_API_KEY:
-        return get_mock_data_prep_code(columns_info, drop_features)
+        return get_mock_data_prep_code(columns_info, drop_features, refinement_prompt)
         
     client = get_genai_client()
     prompt = f"""
@@ -267,6 +279,9 @@ def run_data_prep_agent(file_name: str, row_count: int, columns_info: dict, drop
     
     Make sure your code does not contain any markdown block wrappers (like ```python) in the code field of the JSON. It must be valid executable python code.
     """
+
+    if refinement_prompt:
+        prompt += f"\n\n=== PROGRESSIVE REFINEMENT FEEDBACK ===\n{refinement_prompt}\nPlease repair the script based on this feedback.\n"
     
     try:
         response = client.models.generate_content(
@@ -282,11 +297,11 @@ def run_data_prep_agent(file_name: str, row_count: int, columns_info: dict, drop
         return CodeAgentResponse(**data)
     except Exception as e:
         print(f"Error in data_prep_agent API call: {e}. Falling back to mock.")
-        return get_mock_data_prep_code(columns_info, drop_features)
+        return get_mock_data_prep_code(columns_info, drop_features, refinement_prompt)
 
-def run_ml_modeling_agent(features: list, target_col: str, k_clusters: int = 3, drop_features=None) -> CodeAgentResponse:
+def run_ml_modeling_agent(features: list, target_col: str, k_clusters: int = 3, drop_features=None, temperature: float = 0.1, refinement_prompt=None) -> CodeAgentResponse:
     if not HAS_API_KEY:
-        return get_mock_modeling_code(features, target_col, k_clusters, drop_features)
+        return get_mock_modeling_code(features, target_col, k_clusters, drop_features, refinement_prompt)
         
     client = get_genai_client()
     features = [f for f in features if f != target_col and f not in (drop_features or [])]
@@ -308,18 +323,22 @@ def run_ml_modeling_agent(features: list, target_col: str, k_clusters: int = 3, 
     4. Fit a K-Means clustering model from `sklearn.cluster.KMeans` using all numeric features. Use k = {k_clusters}.
     5. Generate a scatter plot of the clusters using the first two numeric features and show it with `plt.show()`.
     6. Calculate the R2 score for regression, model coefficients, intercept, and silhouette score for clustering.
-    7. Detect multicollinearity (compute simple pairwise correlations > 0.70 between features).
+    7. Detect multicollinearity using Variance Inflation Factors (VIF) for all regression features. Do NOT import statsmodels. Instead, compute VIF for each feature using scikit-learn's LinearRegression by regressing that feature against all other features (VIF = 1 / (1 - R2)).
     8. VERY IMPORTANT: Save a JSON file named 'metrics.json' with keys:
        - 'r2' (float)
        - 'coefficients' (dict mapping features to floats)
        - 'intercept' (float)
        - 'silhouette' (float)
        - 'k_clusters' (int)
-       - 'multicollinear_warnings' (list of lists representing correlation pairs: [col1, col2, corr_value])
-    9. Print out the R2 score, coefficients, and silhouette score clearly.
+       - 'vifs' (dict mapping features to floats)
+       - 'multicollinear_warnings' (list of features exceeding VIF 5.0)
+    9. Print out the R2 score, coefficients, VIF values, and silhouette score clearly.
     
     Make sure the python code is self-contained, robust, handles NaN checks, and writes 'metrics.json' correctly.
     """
+
+    if refinement_prompt:
+        prompt += f"\n\n=== PROGRESSIVE REFINEMENT FEEDBACK ===\n{refinement_prompt}\nPlease repair the script based on this feedback.\n"
     
     try:
         response = client.models.generate_content(
@@ -328,36 +347,37 @@ def run_ml_modeling_agent(features: list, target_col: str, k_clusters: int = 3, 
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_schema=code_agent_schema,
-                temperature=0.1
+                temperature=temperature
             )
         )
         data = json.loads(response.text)
         return CodeAgentResponse(**data)
     except Exception as e:
         print(f"Error in ml_modeling_agent API call: {e}. Falling back to mock.")
-        return get_mock_modeling_code(features, target_col, k_clusters, drop_features)
+        return get_mock_modeling_code(features, target_col, k_clusters, drop_features, refinement_prompt)
 
 def run_statistical_judge_agent(metrics: dict, stdout_logs: str, self_correction_count: int) -> JudgeAgentResponse:
     if not HAS_API_KEY:
         r2 = metrics.get("r2", 0)
-        collinear_pairs = metrics.get("multicollinear_warnings", [])
-        approved = True
+        vifs = metrics.get("vifs", {})
+        high_vifs = [col for col, val in vifs.items() if val > 5.0]
+        
+        approved = r2 >= 0.60 and len(high_vifs) == 0
         critique = "Local Judge Evaluation:\n"
         suggested_overrides = {}
         
-        if r2 < 0.50:
+        if r2 < 0.60:
             approved = False
-            critique += f"- R2 score is too low ({r2:.4f} < 0.50). Regression model fit is weak.\n"
+            critique += f"- R2 score is too low ({r2:.4f} < 0.60). Regression model fit is weak.\n"
         else:
-            critique += f"- R2 score is acceptable ({r2:.4f} >= 0.50).\n"
+            critique += f"- R2 score is acceptable ({r2:.4f} >= 0.60).\n"
             
-        if collinear_pairs:
+        if high_vifs:
             approved = False
-            critique += f"- Detected multicollinear feature pairs: {collinear_pairs}.\n"
-            worst_col = collinear_pairs[0][0]
-            suggested_overrides["drop_features"] = [worst_col]
+            critique += f"- Detected multicollinear features with VIF > 5.0: {high_vifs}.\n"
+            suggested_overrides["drop_features"] = high_vifs
         else:
-            critique += "- No severe multicollinearity detected between features.\n"
+            critique += "- No severe multicollinearity (VIF > 5.0) detected between features.\n"
             
         if approved:
             critique += "Run approved! All criteria satisfied."
@@ -383,11 +403,17 @@ def run_statistical_judge_agent(metrics: dict, stdout_logs: str, self_correction
     
     Current self-correction loop counter: {self_correction_count}
     
-    Your Evaluation Guidelines:
-    1. If the R2 score is under 0.50, flag it.
-    2. If there are multicollinearity indicators (high correlation pairs, coefficients with unexpected signs, or explicit warnings), flag it.
-    3. If there are issues, set 'approved' to false. Provide a thorough 'critique' and suggest overrides in 'suggested_overrides' (e.g. key 'drop_features' containing list of features to drop, or 'k_clusters' to adjust).
-    4. If metrics are healthy (R2 >= 0.50, low multicollinearity), set 'approved' to true.
+    Your Evaluation Guidelines (Dual-Stage Verification):
+    
+    STAGE 1: Code Safety & Syntax
+    - Inspect the logs for execution halts, tracebacks, syntax errors, or package import conflicts.
+    - If a code execution error occurred, set approved = False, note "syntax_error" in overrides, and pass the traceback in critique.
+    
+    STAGE 2: Statistical Boundary Analysis
+    - Check the Multiple Linear Regression metrics:
+      * If R2 is less than 0.60, mark approved = False.
+      * If any feature's Variance Inflation Factor (VIF) exceeds 5.0, mark approved = False and explicitly list the features to drop in 'suggested_overrides' as a list of strings: {{"drop_features": ["col_name"]}}.
+    - If metrics are healthy (R2 >= 0.60, VIFs <= 5.0, no errors), mark approved = True.
     """
     
     try:
@@ -405,12 +431,13 @@ def run_statistical_judge_agent(metrics: dict, stdout_logs: str, self_correction
     except Exception as e:
         print(f"Error in statistical_judge_agent API call: {e}. Falling back to rule-based.")
         r2 = metrics.get("r2", 0)
-        collinear_pairs = metrics.get("multicollinear_warnings", [])
-        approved = r2 >= 0.50 and not collinear_pairs
-        critique = f"API Error fallback: approved={approved}. R2={r2:.4f}, collinearity={bool(collinear_pairs)}."
+        vifs = metrics.get("vifs", {})
+        high_vifs = [col for col, val in vifs.items() if val > 5.0]
+        approved = r2 >= 0.60 and len(high_vifs) == 0
+        critique = f"API Error fallback: approved={approved}. R2={r2:.4f}, high_vifs={high_vifs}."
         suggested = {}
-        if not approved and collinear_pairs:
-            suggested["drop_features"] = [collinear_pairs[0][0]]
+        if not approved and high_vifs:
+            suggested["drop_features"] = high_vifs
         return JudgeAgentResponse(approved=approved, critique=critique, suggested_overrides=suggested)
 
 def run_writer_agent(dataset_name: str, row_count: int, initial_schema: dict, data_prep_summary: str, modeling_summary: str, metrics: dict, judge_critique: str) -> WriterAgentResponse:
@@ -464,7 +491,7 @@ This report analyzes the dataset **{dataset_name}** containing **{row_count}** o
     Your Report MUST Include:
     1. A beautiful layout with clear headers.
     2. Executive Summary detailing what the statistical modeling reveals about the dataset.
-    3. Regression analysis explanation: translate the meaning of the Intercept and Coefficients (coefficients show the unit impact on target; explain this in business terms).
+    3. Regression analysis explanation: translate the meaning of the Intercept and Coefficients (coefficients show the unit impact on target; explain this in business terms). Include calculated VIFs and note if multicollinearity was resolved.
     4. Segmentation details: describe the clusters, silhouette value, and how groups are partitioned.
     5. Validation section: state the model's reliability based on the Judge's critique.
     6. Actionable recommendations based on the findings.
