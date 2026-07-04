@@ -5,6 +5,76 @@ import tempfile
 import shutil
 import base64
 import glob
+import ast
+
+def verify_code_safety(code_string: str) -> (bool, str):
+    """
+    Scans the generated Python code block before execution.
+    - Prevents system command calls (os.system, subprocess, etc.)
+    - Prevents network operations (requests, urllib, socket)
+    - Enforces import whitelist (pandas, numpy, scikit-learn, statsmodels, matplotlib, seaborn, json, math)
+    - Restricts local file operations to authorized inputs/outputs.
+    """
+    # 1. Broad string analysis for blocked calls
+    blocked_keywords = [
+        "os.system", "subprocess", "shutil", "sys.argv", "sys.exit", 
+        "eval(", "exec(", "globals()", "locals()", "requests", "urllib", 
+        "socket", "ftplib", "http.client", "urllib2", "webbrowser",
+        "tempfile", "pathlib", "os.walk", "os.listdir", "os.remove", 
+        "os.rmdir", "os.rename", "os.replace", "os.chmod", "os.chown"
+    ]
+    for kw in blocked_keywords:
+        if kw in code_string:
+            return False, f"Blocked code containing unsafe keyword: '{kw}'"
+
+    # 2. AST parsing to inspect import targets and open() file paths
+    try:
+        root = ast.parse(code_string)
+    except SyntaxError as se:
+        return False, f"Syntax Error during safety verification: {str(se)}"
+
+    allowed_modules = {
+        "pandas", "numpy", "sklearn", "sklearn.linear_model", "sklearn.cluster", 
+        "sklearn.metrics", "sklearn.preprocessing", "statsmodels", 
+        "statsmodels.stats.outliers_influence", "matplotlib", "matplotlib.pyplot", 
+        "seaborn", "json", "math", "warnings", "datetime", "collections"
+    }
+
+    for node in ast.walk(root):
+        # Enforce whitelist on imports
+        if isinstance(node, ast.Import):
+            for name in node.names:
+                base_module = name.name.split('.')[0]
+                if base_module not in allowed_modules:
+                    return False, f"Package Hallucination / Blocked Import: module '{name.name}' is not whitelisted."
+        elif isinstance(node, ast.ImportFrom):
+            base_module = node.module.split('.')[0] if node.module else ""
+            if base_module not in allowed_modules:
+                return False, f"Package Hallucination / Blocked Import: module '{node.module}' is not whitelisted."
+
+        # Restrict open() file calls to allowed filenames only
+        elif isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id == "open":
+                if len(node.args) > 0:
+                    arg = node.args[0]
+                    if isinstance(arg, ast.Constant):
+                        filename = str(arg.value)
+                    elif isinstance(arg, ast.Str):
+                        filename = arg.s
+                    else:
+                        return False, "Dynamic filename calls in 'open()' are forbidden for safety."
+
+                    allowed_files = {"dataset.csv", "cleaned_dataset.csv", "metrics.json", "clean.csv"}
+                    base_name = os.path.basename(filename)
+                    if base_name not in allowed_files:
+                        return False, f"Security Block: Attempt to access local file '{filename}' outside of allowed workspace files ('dataset.csv', 'cleaned_dataset.csv', 'metrics.json', 'clean.csv')."
+
+            # Block dangerous attributes calls on imported packages
+            elif isinstance(node.func, ast.Attribute):
+                if node.func.attr in ("system", "popen", "subprocess", "rmtree", "remove", "listdir"):
+                    return False, f"Security Block: Dangerous method call '{node.func.attr}' is blocked."
+
+    return True, ""
 
 def execute_code(
     code_string: str, 
@@ -17,6 +87,18 @@ def execute_code(
     Injects a matplotlib.pyplot.show interceptor to capture any plotted graphs.
     Supports additional inputs and output file persistence.
     """
+    # Run safety checks
+    is_safe, violation_reason = verify_code_safety(code_string)
+    if not is_safe:
+        return {
+            "success": False,
+            "stdout": "",
+            "stderr": f"Safety Guardrail Exception: {violation_reason}",
+            "exit_code": -1,
+            "plots": [],
+            "metrics": {}
+        }
+
     # Create temporary execution directory
     temp_dir = tempfile.mkdtemp()
     
@@ -134,3 +216,4 @@ plt.show = _intercepted_show
     finally:
         # Clean up temporary directory
         shutil.rmtree(temp_dir, ignore_errors=True)
+

@@ -19,6 +19,32 @@ from app.agents import (
 def run_test():
     print("=== STARTING BACKEND PIPELINE VALIDATION ===")
     
+    # 0. Safety Guardrail & Sandboxing Unit Tests
+    print("\n--- SAFETY GUARDRAIL & SANDBOXING TESTS ---")
+    
+    # Test Case A: Block systemic calls
+    code_system_call = "import os\nos.system('echo hack')"
+    res_a = execute_code(code_system_call, "test_sales.csv")
+    print(f"Safety Test A (System Call Blocked): Success={res_a['success']}, Stderr={repr(res_a['stderr'])}")
+    assert not res_a['success']
+    assert "Safety Guardrail Exception" in res_a['stderr']
+    
+    # Test Case B: Block unrecognized packages (hallucinations)
+    code_package_hallucination = "import flask\nprint('imported')"
+    res_b = execute_code(code_package_hallucination, "test_sales.csv")
+    print(f"Safety Test B (Package Import Blocked): Success={res_b['success']}, Stderr={repr(res_b['stderr'])}")
+    assert not res_b['success']
+    assert "whitelisted" in res_b['stderr']
+    
+    # Test Case C: Block directory traversal / unauthorized files
+    code_unauthorized_file = "with open('/etc/passwd', 'r') as f:\n    pass"
+    res_c = execute_code(code_unauthorized_file, "test_sales.csv")
+    print(f"Safety Test C (File Access Blocked): Success={res_c['success']}, Stderr={repr(res_c['stderr'])}")
+    assert not res_c['success']
+    assert "outside of allowed workspace files" in res_c['stderr']
+    
+    print("Safety Guardrail Validation Passed: 3/3 test cases blocked successfully.")
+
     # 1. Initialize DB
     init_db()
     

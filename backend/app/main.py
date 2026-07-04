@@ -371,6 +371,13 @@ async def run_pipeline_orchestrator(
             "success": exec_res["success"]
         })
         
+        # Progressive disclosure layer: Context-compact memory to retain only final metrics/schema and discard old code scripts
+        if len(session_state["iterations"]) > 1:
+            for old_it in session_state["iterations"][:-1]:
+                old_it["code"] = "[Archived to Supabase Logs]"
+                old_it["stdout"] = "[Archived to Supabase Logs]"
+                old_it["stderr"] = "[Archived to Supabase Logs]"
+        
         # STAGE 1: Code Safety & Syntax checks
         if not exec_res["success"]:
             tb = exec_res["stderr"] or exec_res["stdout"] or "Unknown execution error."
