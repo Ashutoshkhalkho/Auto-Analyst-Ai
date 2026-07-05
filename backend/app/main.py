@@ -557,10 +557,7 @@ Please fix the script to compile safely. Double check imports and variables.
             overrides = judge_res.suggested_overrides or {}
             new_drops = overrides.get("drop_features", [])
             
-            # Ensure VIF high items are added to drops
-            for hv in high_vifs:
-                if hv not in new_drops:
-                    new_drops.append(hv)
+
                     
             if judge_approved and r2 >= 0.60 and len(high_vifs) == 0:
                 await manager.send_json(run_id, {

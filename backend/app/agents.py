@@ -1,5 +1,7 @@
 import os
 import json
+import time
+import random
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
@@ -11,6 +13,28 @@ load_dotenv()
 # Check for Gemini API key
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 HAS_API_KEY = bool(GEMINI_API_KEY)
+
+def generate_content_with_retry(client, model, contents, config, max_retries=4):
+    """
+    Calls client.models.generate_content with exponential backoff on 429 rate limit errors.
+    """
+    delay = 1.5
+    for attempt in range(max_retries):
+        try:
+            return client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=config
+            )
+        except APIError as e:
+            if getattr(e, "code", None) == 429 or "quota" in str(e).lower() or "rate limit" in str(e).lower():
+                if attempt < max_retries - 1:
+                    sleep_time = delay + random.uniform(0.1, 0.5)
+                    print(f"Gemini API 429 Rate Limit hit. Retrying in {sleep_time:.2f}s (Attempt {attempt + 1}/{max_retries})...")
+                    time.sleep(sleep_time)
+                    delay *= 2.0
+                    continue
+            raise e
 
 # Use gemini-1.5-flash as the default model (works on all developer API keys)
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
@@ -302,7 +326,8 @@ def run_data_prep_agent(file_name: str, row_count: int, columns_info: dict, drop
         prompt += f"\n\n=== PROGRESSIVE REFINEMENT FEEDBACK ===\n{refinement_prompt}\nPlease repair the script based on this feedback.\n"
     
     try:
-        response = client.models.generate_content(
+        response = generate_content_with_retry(
+            client=client,
             model=GEMINI_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(
@@ -362,7 +387,8 @@ def run_ml_modeling_agent(features: list, target_col: str, k_clusters: int = 3, 
         prompt += f"\n\n=== PROGRESSIVE REFINEMENT FEEDBACK ===\n{refinement_prompt}\nPlease repair the script based on this feedback.\n"
     
     try:
-        response = client.models.generate_content(
+        response = generate_content_with_retry(
+            client=client,
             model=GEMINI_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(
@@ -398,8 +424,9 @@ def run_statistical_judge_agent(metrics: dict, stdout_logs: str, self_correction
             
         if high_vifs:
             approved = False
-            critique += f"- Detected multicollinear features with VIF > 5.0: {high_vifs}.\n"
-            suggested_overrides["drop_features"] = high_vifs
+            highest_vif_col = max(high_vifs, key=lambda c: vifs[c])
+            critique += f"- Detected multicollinear features with VIF > 5.0: {high_vifs}. Suggesting dropping the highest VIF feature: {highest_vif_col} ({vifs[highest_vif_col]:.2f}).\n"
+            suggested_overrides["drop_features"] = [highest_vif_col]
         else:
             critique += "- No severe multicollinearity (VIF > 5.0) detected between features.\n"
             
@@ -436,12 +463,13 @@ def run_statistical_judge_agent(metrics: dict, stdout_logs: str, self_correction
     STAGE 2: Statistical Boundary Analysis
     - Check the Multiple Linear Regression metrics:
       * If R2 is less than 0.60, mark approved = False.
-      * If any feature's Variance Inflation Factor (VIF) exceeds 5.0, mark approved = False and explicitly list the features to drop in 'suggested_overrides' as a list of strings: {{"drop_features": ["col_name"]}}.
+      * If any feature's Variance Inflation Factor (VIF) exceeds 5.0, mark approved = False. Identify the single feature with the highest VIF value and explicitly list only that feature in 'suggested_overrides' as a list of strings: {{"drop_features": ["highest_vif_feature_name"]}}. Do not drop all high VIF features at once; drop them one-by-one per iteration.
     - If metrics are healthy (R2 >= 0.60, VIFs <= 5.0, no errors), mark approved = True.
     """
     
     try:
-        response = client.models.generate_content(
+        response = generate_content_with_retry(
+            client=client,
             model=GEMINI_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(
@@ -461,7 +489,8 @@ def run_statistical_judge_agent(metrics: dict, stdout_logs: str, self_correction
         critique = f"API Error fallback: approved={approved}. R2={r2:.4f}, high_vifs={high_vifs}."
         suggested = {}
         if not approved and high_vifs:
-            suggested["drop_features"] = high_vifs
+            highest_vif_col = max(high_vifs, key=lambda c: vifs[c])
+            suggested["drop_features"] = [highest_vif_col]
         return JudgeAgentResponse(approved=approved, critique=critique, suggested_overrides=suggested)
     except Exception as e:
         print(f"Unexpected error in statistical_judge_agent API call: {e}. Falling back to rule-based.")
@@ -472,7 +501,8 @@ def run_statistical_judge_agent(metrics: dict, stdout_logs: str, self_correction
         critique = f"API Error fallback: approved={approved}. R2={r2:.4f}, high_vifs={high_vifs}."
         suggested = {}
         if not approved and high_vifs:
-            suggested["drop_features"] = high_vifs
+            highest_vif_col = max(high_vifs, key=lambda c: vifs[c])
+            suggested["drop_features"] = [highest_vif_col]
         return JudgeAgentResponse(approved=approved, critique=critique, suggested_overrides=suggested)
 
 def run_writer_agent(dataset_name: str, row_count: int, initial_schema: dict, data_prep_summary: str, modeling_summary: str, metrics: dict, judge_critique: str) -> WriterAgentResponse:
@@ -535,7 +565,8 @@ This report analyzes the dataset **{dataset_name}** containing **{row_count}** o
     """
     
     try:
-        response = client.models.generate_content(
+        response = generate_content_with_retry(
+            client=client,
             model=GEMINI_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(
