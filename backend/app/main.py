@@ -105,7 +105,17 @@ async def upload_dataset(file: UploadFile = File(...)):
             if df[col].dtype in ['int64', 'float64']:
                 classification = "numerical"
             else:
-                classification = "categorical"
+                # Try coercion to handle dirty numeric columns (e.g. Age with 'N/A' or purchase_amount with 'abc')
+                coerced = pd.to_numeric(df[col], errors='coerce')
+                non_null_before = df[col].dropna().count()
+                non_null_after = coerced.dropna().count()
+                if non_null_before > 0 and (non_null_after / non_null_before) >= 0.5:
+                    classification = "numerical"
+                    dtype = "float64"
+                    null_count = int(coerced.isnull().sum())
+                    missing_pct = float((null_count / row_count) * 100) if row_count > 0 else 0.0
+                else:
+                    classification = "categorical"
                 
             columns_json[col] = {
                 "dtype": dtype,
@@ -156,7 +166,23 @@ async def analyze_dataset(
             dtype = str(df[col].dtype)
             null_count = int(df[col].isnull().sum())
             missing_pct = float((null_count / row_count) * 100) if row_count > 0 else 0.0
-            classification = "numerical" if df[col].dtype in ['int64', 'float64'] else "categorical"
+            
+            # Classify type
+            if df[col].dtype in ['int64', 'float64']:
+                classification = "numerical"
+            else:
+                # Try coercion to handle dirty numeric columns (e.g. Age with 'N/A' or purchase_amount with 'abc')
+                coerced = pd.to_numeric(df[col], errors='coerce')
+                non_null_before = df[col].dropna().count()
+                non_null_after = coerced.dropna().count()
+                if non_null_before > 0 and (non_null_after / non_null_before) >= 0.5:
+                    classification = "numerical"
+                    dtype = "float64"
+                    null_count = int(coerced.isnull().sum())
+                    missing_pct = float((null_count / row_count) * 100) if row_count > 0 else 0.0
+                else:
+                    classification = "categorical"
+                    
             columns_json[col] = {
                 "dtype": dtype,
                 "null_count": null_count,

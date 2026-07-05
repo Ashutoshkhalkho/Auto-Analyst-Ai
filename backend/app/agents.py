@@ -192,17 +192,46 @@ cat_cols = {cat_cols}
 numeric_cols = [c for c in numeric_cols if c in df.columns]
 cat_cols = [c for c in cat_cols if c in df.columns]
 
-# Impute missing values
+# Coerce object columns that are mostly numeric (to handle typos like 'N/A', 'abc' in numbers)
+for col in list(cat_cols):
+    if col in df.columns and df[col].dtype == 'object':
+        coerced = pd.to_numeric(df[col], errors='coerce')
+        non_null_before = df[col].dropna().count()
+        non_null_after = coerced.dropna().count()
+        if non_null_before > 0 and (non_null_after / non_null_before) >= 0.5:
+            df[col] = coerced
+            print(f"Coerced column '{{col}}' to numeric (converted non-numeric typos to NaN)")
+            if col not in numeric_cols:
+                numeric_cols.append(col)
+            if col in cat_cols:
+                cat_cols.remove(col)
+
+# Clean and clip numeric outliers (e.g. negative ages or placeholder 999999 values)
 for col in numeric_cols:
-    if df[col].isnull().any():
+    if col in df.columns:
+        # Coerce to numeric if not already numeric (handles dirty numerical values)
+        if not pd.api.types.is_numeric_dtype(df[col]):
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+            print(f"Coerced numeric column '{{col}}' to float64 (non-numeric values became NaN)")
+            
+        # Impute missing values with median first
         median_val = df[col].median()
         if pd.isnull(median_val):
             median_val = 0.0
         df[col] = df[col].fillna(median_val)
-        print(f"Imputed missing in numeric '{{col}}' with median: {{median_val}}")
+        
+        # Clip outliers using IQR (1.5 * IQR) boundary capping
+        q25 = df[col].quantile(0.25)
+        q75 = df[col].quantile(0.75)
+        iqr = q75 - q25
+        lower_bound = q25 - 1.5 * iqr
+        upper_bound = q75 + 1.5 * iqr
+        df[col] = df[col].clip(lower=lower_bound, upper=upper_bound)
+        print(f"Imputed and capped outliers in numeric '{{col}}' to [{{lower_bound:.2f}}, {{upper_bound:.2f}}]")
 
+# Impute categorical columns with mode
 for col in cat_cols:
-    if df[col].isnull().any():
+    if col in df.columns and df[col].isnull().any():
         mode_val = df[col].mode().iloc[0] if not df[col].mode().empty else "missing"
         df[col] = df[col].fillna(mode_val)
         print(f"Imputed missing in categorical '{{col}}' with mode: {{mode_val}}")
@@ -358,10 +387,12 @@ def run_data_prep_agent(file_name: str, row_count: int, columns_info: dict, drop
     Your Python code MUST:
     1. Read 'dataset.csv' into a pandas DataFrame: `df = pd.read_csv("dataset.csv")`.
     2. Drop any columns requested in the features to drop manually.
-    3. Identify and impute missing values (fill missing numerical values with their median/mean, and categorical values with their mode or a separate 'missing' category).
-    4. Apply `sklearn.preprocessing.StandardScaler` to scale all numerical columns except any identified ID/target columns, keeping column headers.
-    5. Save the final cleaned dataframe to 'cleaned_dataset.csv' via `df.to_csv("cleaned_dataset.csv", index=False)`.
-    6. Print a text summary of operations performed (e.g. shape changes, columns scaled, nulls imputed).
+    3. Identify and handle dirty numerical columns: For any categorical/object columns that contain mostly numeric values (e.g. Age with 'N/A' or purchase_amount with 'abc'), coerce them using `pd.to_numeric(df[col], errors='coerce')` so they can be processed numerically.
+    4. Impute missing values (fill missing numerical values with their median, and categorical values with their mode or a separate 'missing' category).
+    5. Clean outliers in numerical columns by clipping them to the 1st and 99th percentiles.
+    6. Apply `sklearn.preprocessing.StandardScaler` to scale all numerical columns except any identified ID/target columns, keeping column headers.
+    7. Save the final cleaned dataframe to 'cleaned_dataset.csv' via `df.to_csv("cleaned_dataset.csv", index=False)`.
+    8. Print a text summary of operations performed (e.g. shape changes, columns scaled, nulls imputed).
     
     Make sure your code does not contain any markdown block wrappers (like ```python) in the code field of the JSON. It must be valid executable python code.
     """
