@@ -549,9 +549,8 @@ def run_statistical_judge_agent(metrics: dict, stdout_logs: str, self_correction
             suggested["drop_features"] = [highest_vif_col]
         return JudgeAgentResponse(approved=approved, critique=critique, suggested_overrides=suggested)
 
-def run_writer_agent(dataset_name: str, row_count: int, initial_schema: dict, data_prep_summary: str, modeling_summary: str, metrics: dict, judge_critique: str) -> WriterAgentResponse:
-    if not HAS_API_KEY:
-        report = f"""# Auto-Analyst AI Statistical Report: {dataset_name}
+def generate_local_fallback_report(dataset_name: str, row_count: int, data_prep_summary: str, modeling_summary: str, metrics: dict, judge_critique: str) -> str:
+    report = f"""# Auto-Analyst AI Statistical Report: {dataset_name}
 
 ## Executive Summary
 This report analyzes the dataset **{dataset_name}** containing **{row_count}** observations. A multi-agent statistical pipeline performed data preprocessing, Multiple Linear Regression, and K-Means clustering.
@@ -566,10 +565,10 @@ This report analyzes the dataset **{dataset_name}** containing **{row_count}** o
 - **Intercept**: `{metrics.get('intercept', 0.0):.4f}`
 - **Coefficients**:
 """
-        for feature, coef in metrics.get("coefficients", {}).items():
-            report += f"  - **{feature}**: `{coef:.4f}`\n"
-            
-        report += f"""
+    for feature, coef in metrics.get("coefficients", {}).items():
+        report += f"  - **{feature}**: `{coef:.4f}`\n"
+        
+    report += f"""
 ## Segmentation Analysis (K-Means)
 - **Number of Clusters**: `{metrics.get('k_clusters', 0)}`
 - **Silhouette Score**: `{metrics.get('silhouette', 0.0):.4f}`
@@ -577,8 +576,13 @@ This report analyzes the dataset **{dataset_name}** containing **{row_count}** o
 ## Judge & Quality Validation
 {judge_critique}
 
-*Report compiled by Auto-Analyst Writer Agent.*
+*Report compiled by Auto-Analyst Writer Agent (Local Fallback Mode).*
 """
+    return report
+
+def run_writer_agent(dataset_name: str, row_count: int, initial_schema: dict, data_prep_summary: str, modeling_summary: str, metrics: dict, judge_critique: str) -> WriterAgentResponse:
+    if not HAS_API_KEY or USE_LOCAL_ONLY or is_circuit_broken():
+        report = generate_local_fallback_report(dataset_name, row_count, data_prep_summary, modeling_summary, metrics, judge_critique)
         return WriterAgentResponse(markdown_report=report)
         
     client = get_genai_client()
@@ -622,10 +626,12 @@ This report analyzes the dataset **{dataset_name}** containing **{row_count}** o
         data = json.loads(response.text)
         return WriterAgentResponse(**data)
     except APIError as e:
-        print(f"GenAI API Error in writer_agent (code={e.code}, message={e.message}). Falling back.")
-        report = f"# Local Analysis Report fallback. API Error: {str(e)}"
+        print(f"GenAI API Error in writer_agent (code={e.code}, message={e.message}). Falling back to rule-based report.")
+        report = generate_local_fallback_report(dataset_name, row_count, data_prep_summary, modeling_summary, metrics, judge_critique)
+        report += f"\n\n*(Note: Fallback triggered due to API Cooldown / Error: {e.message})*"
         return WriterAgentResponse(markdown_report=report)
     except Exception as e:
-        print(f"Unexpected error in writer_agent API call: {e}. Falling back.")
-        report = f"# Local Analysis Report fallback. Unexpected Error: {str(e)}"
+        print(f"Unexpected error in writer_agent API call: {e}. Falling back to rule-based report.")
+        report = generate_local_fallback_report(dataset_name, row_count, data_prep_summary, modeling_summary, metrics, judge_critique)
+        report += f"\n\n*(Note: Fallback triggered due to Unexpected Error: {str(e)})*"
         return WriterAgentResponse(markdown_report=report)
