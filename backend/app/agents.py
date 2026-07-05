@@ -2,6 +2,7 @@ import os
 import json
 import time
 import random
+import re
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
@@ -14,10 +15,44 @@ load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 HAS_API_KEY = bool(GEMINI_API_KEY)
 
+# Circuit breaker state to prevent slow agent hangs during 429 blocks
+_last_429_timestamp = 0.0
+CIRCUIT_BREAKER_COOLDOWN = 60.0  # Cooldown period in seconds
+
+# Allow manual override for local-only execution
+USE_LOCAL_ONLY = os.getenv("USE_LOCAL_ONLY", "false").lower() == "true"
+
+def is_circuit_broken():
+    global _last_429_timestamp
+    if _last_429_timestamp > 0:
+        elapsed = time.time() - _last_429_timestamp
+        if elapsed < CIRCUIT_BREAKER_COOLDOWN:
+            return True
+    return False
+
+def record_429():
+    global _last_429_timestamp
+    _last_429_timestamp = time.time()
+
+def parse_retry_after(error_msg):
+    match = re.search(r"please retry in ([\d\.]+)s", error_msg.lower())
+    if match:
+        return float(match.group(1))
+    return None
+
 def generate_content_with_retry(client, model, contents, config, max_retries=4):
     """
     Calls client.models.generate_content with exponential backoff on 429 rate limit errors.
+    Bypasses calls if the circuit breaker is open (cooldown active) or local-only is enforced.
     """
+    if USE_LOCAL_ONLY:
+        print("USE_LOCAL_ONLY is enabled. Bypassing Gemini API call to run fallback local engine immediately.")
+        raise Exception("USE_LOCAL_ONLY active. Bypassing API call.")
+        
+    if is_circuit_broken():
+        print("Gemini API circuit breaker is OPEN (cooldown active). Bypassing API call to run fallback local engine immediately.")
+        raise Exception("Gemini API rate limit cooldown active. Bypassing API call.")
+
     delay = 1.5
     for attempt in range(max_retries):
         try:
@@ -28,6 +63,15 @@ def generate_content_with_retry(client, model, contents, config, max_retries=4):
             )
         except APIError as e:
             if getattr(e, "code", None) == 429 or "quota" in str(e).lower() or "rate limit" in str(e).lower():
+                record_429()  # Trip circuit breaker
+                err_msg = str(e)
+                retry_after = parse_retry_after(err_msg)
+                
+                # If the API tells us to wait more than 2 seconds, don't waste time retrying
+                if retry_after and retry_after > 2.0:
+                    print(f"Gemini API rate limit cooldown required: {retry_after:.2f}s. Tripping circuit breaker and bypassing retries.")
+                    raise e
+                    
                 if attempt < max_retries - 1:
                     sleep_time = delay + random.uniform(0.1, 0.5)
                     print(f"Gemini API 429 Rate Limit hit. Retrying in {sleep_time:.2f}s (Attempt {attempt + 1}/{max_retries})...")
