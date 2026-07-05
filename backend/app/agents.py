@@ -3,6 +3,7 @@ import json
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
+from google.genai.errors import APIError
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -13,6 +14,10 @@ HAS_API_KEY = bool(GEMINI_API_KEY)
 
 # Use gemini-1.5-flash as the default model (works on all developer API keys)
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+# Native code execution tool setup matching the SDK syntax
+# Note: In the google-genai SDK, CodeExecution is named ToolCodeExecution.
+code_execution_tool = types.Tool(code_execution=types.ToolCodeExecution())
 
 # Define Pydantic response models for standard typing in python functions
 class CodeAgentResponse(BaseModel):
@@ -82,8 +87,19 @@ def get_genai_client():
 
 def get_mock_data_prep_code(columns_info, drop_features=None, refinement_prompt=None):
     drop_features = drop_features or []
-    numeric_cols = [c for c, t in columns_info.items() if t in ("float64", "int64") and c not in drop_features]
-    cat_cols = [c for c, t in columns_info.items() if t not in ("float64", "int64") and c not in drop_features]
+    # If columns_info values are dictionaries, extract the dtype string.
+    # Also support "numerical" as a type indicator.
+    columns_dtypes = {}
+    for c, val in columns_info.items():
+        if isinstance(val, dict):
+            columns_dtypes[c] = val.get("dtype", "object")
+        elif val in ("numerical", "categorical"):
+            columns_dtypes[c] = "float64" if val == "numerical" else "object"
+        else:
+            columns_dtypes[c] = str(val)
+            
+    numeric_cols = [c for c, t in columns_dtypes.items() if t in ("float64", "int64") and c not in drop_features]
+    cat_cols = [c for c, t in columns_dtypes.items() if t not in ("float64", "int64") and c not in drop_features]
     
     code = f"""import pandas as pd
 import numpy as np
@@ -112,6 +128,8 @@ cat_cols = [c for c in cat_cols if c in df.columns]
 for col in numeric_cols:
     if df[col].isnull().any():
         median_val = df[col].median()
+        if pd.isnull(median_val):
+            median_val = 0.0
         df[col] = df[col].fillna(median_val)
         print(f"Imputed missing in numeric '{{col}}' with median: {{median_val}}")
 
@@ -295,8 +313,11 @@ def run_data_prep_agent(file_name: str, row_count: int, columns_info: dict, drop
         )
         data = json.loads(response.text)
         return CodeAgentResponse(**data)
+    except APIError as e:
+        print(f"GenAI API Error in data_prep_agent (code={e.code}, message={e.message}). Falling back to mock.")
+        return get_mock_data_prep_code(columns_info, drop_features, refinement_prompt)
     except Exception as e:
-        print(f"Error in data_prep_agent API call: {e}. Falling back to mock.")
+        print(f"Unexpected error in data_prep_agent API call: {e}. Falling back to mock.")
         return get_mock_data_prep_code(columns_info, drop_features, refinement_prompt)
 
 def run_ml_modeling_agent(features: list, target_col: str, k_clusters: int = 3, drop_features=None, temperature: float = 0.1, refinement_prompt=None) -> CodeAgentResponse:
@@ -352,8 +373,11 @@ def run_ml_modeling_agent(features: list, target_col: str, k_clusters: int = 3, 
         )
         data = json.loads(response.text)
         return CodeAgentResponse(**data)
+    except APIError as e:
+        print(f"GenAI API Error in ml_modeling_agent (code={e.code}, message={e.message}). Falling back to mock.")
+        return get_mock_modeling_code(features, target_col, k_clusters, drop_features, refinement_prompt)
     except Exception as e:
-        print(f"Error in ml_modeling_agent API call: {e}. Falling back to mock.")
+        print(f"Unexpected error in ml_modeling_agent API call: {e}. Falling back to mock.")
         return get_mock_modeling_code(features, target_col, k_clusters, drop_features, refinement_prompt)
 
 def run_statistical_judge_agent(metrics: dict, stdout_logs: str, self_correction_count: int) -> JudgeAgentResponse:
@@ -428,8 +452,19 @@ def run_statistical_judge_agent(metrics: dict, stdout_logs: str, self_correction
         )
         data = json.loads(response.text)
         return JudgeAgentResponse(**data)
+    except APIError as e:
+        print(f"GenAI API Error in statistical_judge_agent (code={e.code}, message={e.message}). Falling back to rule-based.")
+        r2 = metrics.get("r2", 0)
+        vifs = metrics.get("vifs", {})
+        high_vifs = [col for col, val in vifs.items() if val > 5.0]
+        approved = r2 >= 0.60 and len(high_vifs) == 0
+        critique = f"API Error fallback: approved={approved}. R2={r2:.4f}, high_vifs={high_vifs}."
+        suggested = {}
+        if not approved and high_vifs:
+            suggested["drop_features"] = high_vifs
+        return JudgeAgentResponse(approved=approved, critique=critique, suggested_overrides=suggested)
     except Exception as e:
-        print(f"Error in statistical_judge_agent API call: {e}. Falling back to rule-based.")
+        print(f"Unexpected error in statistical_judge_agent API call: {e}. Falling back to rule-based.")
         r2 = metrics.get("r2", 0)
         vifs = metrics.get("vifs", {})
         high_vifs = [col for col, val in vifs.items() if val > 5.0]
@@ -511,7 +546,11 @@ This report analyzes the dataset **{dataset_name}** containing **{row_count}** o
         )
         data = json.loads(response.text)
         return WriterAgentResponse(**data)
-    except Exception as e:
-        print(f"Error in writer_agent API call: {e}. Falling back.")
+    except APIError as e:
+        print(f"GenAI API Error in writer_agent (code={e.code}, message={e.message}). Falling back.")
         report = f"# Local Analysis Report fallback. API Error: {str(e)}"
+        return WriterAgentResponse(markdown_report=report)
+    except Exception as e:
+        print(f"Unexpected error in writer_agent API call: {e}. Falling back.")
+        report = f"# Local Analysis Report fallback. Unexpected Error: {str(e)}"
         return WriterAgentResponse(markdown_report=report)

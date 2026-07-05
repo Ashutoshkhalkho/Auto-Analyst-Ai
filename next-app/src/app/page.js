@@ -45,8 +45,10 @@ export default function Dashboard() {
   const terminalEndRef = useRef(null);
   const wsRef = useRef(null);
 
-  // Dynamic API URL for Vercel cloud deployments (falls back to local backend)
-  const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+  // Use relative endpoint in production (Vercel) to avoid CORS violations, fallback to env or localhost for dev.
+  const API_URL = typeof window !== "undefined" && window.location.hostname !== "localhost"
+    ? ""
+    : (process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000");
 
   // Sync DB records on startup
   const [dbStatus, setDbStatus] = useState("connecting");
@@ -56,12 +58,13 @@ export default function Dashboard() {
     fetch(`${API_URL}/api/health`)
       .then((res) => res.json())
       .then((data) => {
-        setDbStatus(data.database_type === "Supabase" ? "supabase connected" : "sqlite active");
-        addLog("SYSTEM", `Connected to backend. Database mode: ${data.database_type}`);
+        const dbType = data?.database_type ?? "SQLite Fallback";
+        setDbStatus(dbType === "Supabase" ? "supabase connected" : "sqlite active");
+        addLog("SYSTEM", `Connected to backend. Database mode: ${dbType}`);
       })
       .catch((e) => {
         setDbStatus("backend offline");
-        addLog("SYSTEM", `Warning: Could not link to backend server at ${API_URL}`);
+        addLog("SYSTEM", `Warning: Could not link to backend server at ${API_URL || "/"}`);
       });
   }, []);
 
@@ -95,23 +98,23 @@ export default function Dashboard() {
       const data = await response.json();
 
       if (response.ok) {
-        setDatasetId(data.dataset_id);
-        setColumns(data.columns);
+        setDatasetId(data?.dataset_id ?? "");
+        setColumns(data?.columns ?? null);
         
         // Auto-select target column (last column) and features (all other numeric columns)
-        const colsList = Object.keys(data.columns);
-        const lastCol = colsList[colsList.length - 1];
+        const colsList = Object.keys(data?.columns ?? {});
+        const lastCol = colsList[colsList.length - 1] ?? "";
         setTargetCol(lastCol);
         
-        const numerics = colsList.filter(c => c !== lastCol && data.columns[c].type === "numerical");
+        const numerics = colsList.filter(c => c !== lastCol && data?.columns?.[c]?.type === "numerical");
         setSelectedFeatures(numerics);
 
-        addLog("SYSTEM", `Ingestion complete. Registered ${data.row_count} rows, ${colsList.length} features.`);
+        addLog("SYSTEM", `Ingestion complete. Registered ${data?.row_count ?? 0} rows, ${colsList.length} features.`);
       } else {
-        addLog("ERROR", data.detail || "Upload failed.");
+        addLog("ERROR", data?.detail ?? "Upload failed.");
       }
     } catch (err) {
-      addLog("ERROR", `Ingestion failure: ${err.message}`);
+      addLog("ERROR", `Ingestion failure: ${err?.message ?? "Unknown error"}`);
     } finally {
       setIsUploading(false);
     }
@@ -144,22 +147,34 @@ export default function Dashboard() {
       const data = await response.json();
 
       if (response.ok) {
-        setRunId(data.run_id);
-        connectWebSocket(data.run_id);
+        setRunId(data?.run_id ?? "");
+        connectWebSocket(data?.run_id ?? "");
       } else {
-        addLog("ERROR", data.detail || "Pipeline start rejected.");
+        addLog("ERROR", data?.detail ?? "Pipeline start rejected.");
         setActiveStep("failed");
       }
     } catch (err) {
-      addLog("ERROR", `Connection error: ${err.message}`);
+      addLog("ERROR", `Connection error: ${err?.message ?? "Unknown error"}`);
       setActiveStep("failed");
     }
   };
 
   // Connect WebSocket to stream logs
   const connectWebSocket = (id) => {
-    const wsProtocol = API_URL.startsWith("https") ? "wss" : "ws";
-    const wsHost = API_URL.replace("http://", "").replace("https://", "");
+    let wsProtocol = "ws";
+    let wsHost = "localhost:8000";
+
+    if (typeof window !== "undefined") {
+      wsProtocol = window.location.protocol === "https:" ? "wss" : "ws";
+      wsHost = window.location.host;
+    }
+
+    // Override if API_URL is absolute
+    if (API_URL && API_URL.startsWith("http")) {
+      wsProtocol = API_URL.startsWith("https") ? "wss" : "ws";
+      wsHost = API_URL.replace("http://", "").replace("https://", "");
+    }
+
     const ws = new WebSocket(`${wsProtocol}://${wsHost}/ws/pipeline/${id}`);
     wsRef.current = ws;
 
@@ -274,18 +289,51 @@ export default function Dashboard() {
     });
   };
 
+  const parseMathAndSubscripts = (str) => {
+    try {
+      if (!str) return "";
+      
+      // Standardize common symbols (e.g. R² -> R^2, R₂ -> R_2)
+      let processedStr = str.replace(/R²/g, "R^2").replace(/R₂/g, "R_2");
+      
+      // Match math subscripts/superscripts like \beta_1, R^2, y_i
+      const matchRegex = /([a-zA-Z0-9\\beta\\alpha\\gamma\\theta\\]+)(_|\^)([a-zA-Z0-9{}]+)/;
+      
+      const parts = processedStr.split(/([a-zA-Z0-9\\beta\\alpha\\gamma\\theta\\]+[_^][a-zA-Z0-9{}]+)/);
+      return parts.map((part, index) => {
+        const subMatch = part.match(matchRegex);
+        if (subMatch) {
+          const base = subMatch[1];
+          const op = subMatch[2];
+          const val = subMatch[3].replace(/[{}]/g, ""); // strip braces
+          
+          return (
+            <span key={index}>
+              {base}
+              {op === '_' ? <sub>{val}</sub> : <sup>{val}</sup>}
+            </span>
+          );
+        }
+        return part;
+      });
+    } catch (e) {
+      console.error("Math parsing error", e);
+      return str;
+    }
+  };
+
   const parseInlines = (text) => {
     const parts = text.split("**");
     return parts.map((part, i) => {
       if (i % 2 === 1) {
-        return <strong key={i} className="font-bold text-slate-900">{part}</strong>;
+        return <strong key={i} className="font-bold text-slate-900">{parseMathAndSubscripts(part)}</strong>;
       }
       const codeParts = part.split("`");
       return codeParts.map((subPart, j) => {
         if (j % 2 === 1) {
           return <code key={j} className="bg-slate-200 text-slate-800 font-mono px-1 py-0.2 rounded text-[9px]">{subPart}</code>;
         }
-        return subPart;
+        return parseMathAndSubscripts(subPart);
       });
     });
   };

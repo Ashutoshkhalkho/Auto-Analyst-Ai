@@ -321,6 +321,80 @@ export default function App() {
     }
   };
 
+  const parseMathAndSubscripts = (str) => {
+    try {
+      if (!str) return '';
+      
+      let processedStr = str.replace(/R²/g, "R^2").replace(/R₂/g, "R_2");
+      const matchRegex = /([a-zA-Z0-9\\beta\\alpha\\gamma\\theta\\]+)(_|\^)([a-zA-Z0-9{}]+)/;
+      
+      const parts = processedStr.split(/([a-zA-Z0-9\\beta\\alpha\\gamma\\theta\\]+[_^][a-zA-Z0-9{}]+)/);
+      return parts.map((part, index) => {
+        const subMatch = part.match(matchRegex);
+        if (subMatch) {
+          const base = subMatch[1];
+          const op = subMatch[2];
+          const val = subMatch[3].replace(/[{}]/g, "");
+          
+          return (
+            <span key={index}>
+              {base}
+              {op === '_' ? <sub>{val}</sub> : <sup>{val}</sup>}
+            </span>
+          );
+        }
+        return part;
+      });
+    } catch (e) {
+      console.error("Math parsing error", e);
+      return str;
+    }
+  };
+
+  const parseInlines = (text) => {
+    const parts = text.split("**");
+    return parts.map((part, i) => {
+      if (i % 2 === 1) {
+        return <strong key={i} className="font-bold text-slate-900 dark:text-white">{parseMathAndSubscripts(part)}</strong>;
+      }
+      const codeParts = part.split("`");
+      return codeParts.map((subPart, j) => {
+        if (j % 2 === 1) {
+          return <code key={j} className="bg-slate-205 dark:bg-slate-800 text-slate-800 dark:text-slate-200 font-mono px-1 py-0.2 rounded text-[9px]">{subPart}</code>;
+        }
+        return parseMathAndSubscripts(subPart);
+      });
+    });
+  };
+
+  const renderMarkdown = (text) => {
+    if (!text) return <p className="text-slate-400 italic text-xs">No analysis report generated yet.</p>;
+    
+    const lines = text.split("\n");
+    return lines.map((line, idx) => {
+      if (line.startsWith("# ")) {
+        return <h1 key={idx} className="text-base font-bold text-slate-950 dark:text-white border-b border-[var(--border)] pb-1 mt-4 mb-2 uppercase tracking-tight">{line.replace("# ", "")}</h1>;
+      }
+      if (line.startsWith("## ")) {
+        return <h2 key={idx} className="text-xs font-semibold text-slate-800 dark:text-slate-200 mt-3 mb-1.5 uppercase tracking-wider">{line.replace("## ", "")}</h2>;
+      }
+      if (line.startsWith("### ")) {
+        return <h3 key={idx} className="text-xs font-medium text-slate-700 dark:text-slate-350 mt-2 mb-1">{line.replace("### ", "")}</h3>;
+      }
+      if (line.trim().startsWith("- ") || line.trim().startsWith("* ")) {
+        return (
+          <li key={idx} className="ml-4 list-disc text-[11px] text-slate-700 dark:text-slate-300 mb-1 leading-relaxed">
+            {parseInlines(line.trim().substring(2))}
+          </li>
+        );
+      }
+      if (line.trim() === "") {
+        return <div key={idx} className="h-1"></div>;
+      }
+      return <p key={idx} className="text-[11px] text-slate-600 dark:text-slate-400 mb-1.5 leading-relaxed">{parseInlines(line)}</p>;
+    });
+  };
+
   return (
     <div className="flex h-screen w-screen overflow-hidden">
       
@@ -451,7 +525,7 @@ export default function App() {
                 <div className="glass-panel p-5 flex flex-col justify-between h-24">
                   <span className="text-xs text-[var(--text-muted)] font-semibold uppercase tracking-wider">Total Pipelines Run</span>
                   <div className="flex items-baseline justify-between mt-2">
-                    <span className="text-3xl font-bold tracking-tight text-[var(--text)]">{metrics.totalRuns}</span>
+                    <span className="text-3xl font-bold tracking-tight text-[var(--text)]">{metrics?.totalRuns ?? 0}</span>
                     <Archive className="h-5 w-5 text-[var(--text-muted)]" />
                   </div>
                 </div>
@@ -460,7 +534,7 @@ export default function App() {
                   <span className="text-xs text-[var(--text-muted)] font-semibold uppercase tracking-wider">Average R² Score</span>
                   <div className="flex items-baseline justify-between mt-2">
                     <span className="text-3xl font-bold tracking-tight text-[var(--success)]">
-                      {metrics.avgR2 > 0 ? metrics.avgR2.toFixed(3) : 'N/A'}
+                      {(metrics?.avgR2 ?? 0) > 0 ? (metrics?.avgR2 ?? 0).toFixed(3) : 'N/A'}
                     </span>
                     <TrendingUp className="h-5 w-5 text-[var(--success)]" />
                   </div>
@@ -469,7 +543,7 @@ export default function App() {
                 <div className="glass-panel p-5 flex flex-col justify-between h-24">
                   <span className="text-xs text-[var(--text-muted)] font-semibold uppercase tracking-wider">Active Worker Tasks</span>
                   <div className="flex items-baseline justify-between mt-2">
-                    <span className="text-3xl font-bold tracking-tight text-[var(--accent)]">{metrics.activeTasks}</span>
+                    <span className="text-3xl font-bold tracking-tight text-[var(--accent)]">{metrics?.activeTasks ?? 0}</span>
                     <Sliders className="h-5 w-5 text-[var(--accent)]" />
                   </div>
                 </div>
@@ -477,8 +551,8 @@ export default function App() {
                 <div className="glass-panel p-5 flex flex-col justify-between h-24">
                   <span className="text-xs text-[var(--text-muted)] font-semibold uppercase tracking-wider">System Health Status</span>
                   <div className="flex items-baseline justify-between mt-2">
-                    <span className="text-sm font-bold tracking-tight text-[var(--text)] truncate" title={metrics.health}>
-                      {metrics.health.split(' ')[0]}
+                    <span className="text-sm font-bold tracking-tight text-[var(--text)] truncate" title={metrics?.health ?? 'Offline'}>
+                      {(metrics?.health ?? 'Offline').split(' ')[0]}
                     </span>
                     <span className={`status-dot green h-3 w-3`} />
                   </div>
@@ -820,8 +894,8 @@ export default function App() {
                         <div className="px-3 py-1 bg-emerald-100 dark:bg-emerald-950/40 border border-[var(--success)]/30 rounded text-[var(--success)] font-semibold inline-block">
                           Final Insight Report Generated
                         </div>
-                        <div className="whitespace-pre-wrap leading-relaxed text-[var(--text)] font-sans text-sm">
-                          {agentOutputs.writer.explanation}
+                        <div className="leading-relaxed text-[var(--text)] font-sans text-sm">
+                          {renderMarkdown(agentOutputs.writer.explanation)}
                         </div>
                       </div>
                     ) : activeStep ? (
@@ -913,13 +987,13 @@ export default function App() {
                       <div className="text-center p-2 border-r border-[var(--border)]">
                         <span className="text-[9px] text-[var(--text-muted)] uppercase tracking-wider block">Fit (R²)</span>
                         <span className="text-sm font-bold text-[var(--success)]">
-                          {selectedArchiveRun.final_metrics?.r2 !== undefined ? selectedArchiveRun.final_metrics.r2.toFixed(3) : 'N/A'}
+                          {selectedArchiveRun.final_metrics?.r2 !== undefined && selectedArchiveRun.final_metrics?.r2 !== null ? selectedArchiveRun.final_metrics.r2.toFixed(3) : 'N/A'}
                         </span>
                       </div>
                       <div className="text-center p-2 border-r border-[var(--border)]">
                         <span className="text-[9px] text-[var(--text-muted)] uppercase tracking-wider block">Silhouette</span>
                         <span className="text-sm font-bold text-[var(--accent)]">
-                          {selectedArchiveRun.final_metrics?.silhouette !== undefined && selectedArchiveRun.final_metrics.silhouette !== null
+                          {selectedArchiveRun.final_metrics?.silhouette !== undefined && selectedArchiveRun.final_metrics?.silhouette !== null
                             ? selectedArchiveRun.final_metrics.silhouette.toFixed(3) 
                             : 'N/A'}
                         </span>
@@ -927,7 +1001,7 @@ export default function App() {
                       <div className="text-center p-2 border-r border-[var(--border)]">
                         <span className="text-[9px] text-[var(--text-muted)] uppercase tracking-wider block">K-Clusters</span>
                         <span className="text-sm font-bold text-[var(--text)]">
-                          {selectedArchiveRun.final_metrics?.k_clusters || 'N/A'}
+                          {selectedArchiveRun.final_metrics?.k_clusters ?? 'N/A'}
                         </span>
                       </div>
                       <div className="text-center p-2">
@@ -941,8 +1015,8 @@ export default function App() {
                     {/* Show generated report inside archive details */}
                     <div className="space-y-3">
                       <span className="text-xs font-semibold text-[var(--text-muted)] uppercase tracking-wider block border-b border-[var(--border)] pb-1.5">Writer Insights Report</span>
-                      <div className="bg-[var(--background)] p-5 rounded-lg border border-[var(--border)] max-h-[450px] overflow-y-auto font-sans text-sm text-[var(--text)] leading-relaxed whitespace-pre-wrap">
-                        {selectedArchiveRun.logs?.find(l => l.agent_name === 'writer')?.model_response || 'No markdown insights found for this run.'}
+                      <div className="bg-[var(--background)] p-5 rounded-lg border border-[var(--border)] max-h-[450px] overflow-y-auto font-sans text-sm text-[var(--text)] leading-relaxed">
+                        {renderMarkdown(selectedArchiveRun.logs?.find(l => l.agent_name === 'writer')?.model_response)}
                       </div>
                     </div>
 

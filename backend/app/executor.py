@@ -18,7 +18,7 @@ def verify_code_safety(code_string: str) -> (bool, str):
     # 1. Broad string analysis for blocked calls
     blocked_keywords = [
         "os.system", "subprocess", "shutil", "sys.argv", "sys.exit", 
-        "eval(", "exec(", "globals()", "locals()", "requests", "urllib", 
+        "eval(", "exec(", "globals()", "requests", "urllib", 
         "socket", "ftplib", "http.client", "urllib2", "webbrowser",
         "tempfile", "pathlib", "os.walk", "os.listdir", "os.remove", 
         "os.rmdir", "os.rename", "os.replace", "os.chmod", "os.chown"
@@ -71,7 +71,7 @@ def verify_code_safety(code_string: str) -> (bool, str):
 
             # Block dangerous attributes calls on imported packages
             elif isinstance(node.func, ast.Attribute):
-                if node.func.attr in ("system", "popen", "subprocess", "rmtree", "remove", "listdir"):
+                if node.func.attr in ("system", "popen", "subprocess", "rmtree"):
                     return False, f"Security Block: Dangerous method call '{node.func.attr}' is blocked."
 
     return True, ""

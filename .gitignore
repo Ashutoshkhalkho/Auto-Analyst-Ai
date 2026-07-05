@@ -1,0 +1,25 @@
+# Environment variables (contains API keys and secrets)
+.env
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python cache and bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local SQLite databases
+*.db
+*.sqlite3
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Backend temporary execution outputs/uploads
+backend/uploads/*
+!backend/uploads/.gitkeep

@@ -1,12 +1,38 @@
 import os
 import json
 import shutil
+import math
+import numpy as np
 import pandas as pd
 from typing import List, Optional
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, WebSocket, WebSocketDisconnect, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
+def sanitize_json_payload(obj):
+    """
+    Recursively converts float NaN/Inf values, numpy types, and data arrays
+    into JSON-serializable payloads.
+    """
+    if isinstance(obj, dict):
+        return {k: sanitize_json_payload(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [sanitize_json_payload(x) for x in obj]
+    elif isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    elif isinstance(obj, (np.integer, np.int64, np.int32)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float64, np.float32)):
+        if np.isnan(obj) or np.isinf(obj):
+            return None
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return sanitize_json_payload(obj.tolist())
+    else:
+        return obj
 
 from app.database import (
     init_db, create_dataset, get_datasets, create_pipeline_run, 
@@ -96,6 +122,100 @@ async def upload_dataset(file: UploadFile = File(...)):
             "file_name": file.filename,
             "row_count": row_count,
             "columns": columns_json
+        }
+    except Exception as e:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        raise HTTPException(status_code=500, detail=f"Failed to process CSV file: {str(e)}")
+
+@app.post("/api/analyze")
+async def analyze_dataset(
+    file: UploadFile = File(...),
+    target_col: Optional[str] = Form(None),
+    features: Optional[str] = Form(None),
+    k_clusters: Optional[int] = Form(3),
+    drop_features: Optional[str] = Form(None)
+):
+    if not file.filename.endswith('.csv'):
+        raise HTTPException(status_code=400, detail="Only CSV files are supported.")
+        
+    file_path = os.path.join(UPLOAD_DIR, file.filename)
+    
+    # Save the file
+    with open(file_path, "wb") as buffer:
+        content = await file.read()
+        buffer.write(content)
+        
+    try:
+        df = pd.read_csv(file_path)
+        row_count = len(df)
+        
+        # Extract metadata columns
+        columns_json = {}
+        for col in df.columns:
+            dtype = str(df[col].dtype)
+            null_count = int(df[col].isnull().sum())
+            missing_pct = float((null_count / row_count) * 100) if row_count > 0 else 0.0
+            classification = "numerical" if df[col].dtype in ['int64', 'float64'] else "categorical"
+            columns_json[col] = {
+                "dtype": dtype,
+                "null_count": null_count,
+                "missing_pct": missing_pct,
+                "type": classification
+            }
+            
+        dataset_id = create_dataset(file.filename, row_count, columns_json)
+        
+        # Parse target, features, and drops
+        parsed_features = json.loads(features) if features else []
+        parsed_drops = json.loads(drop_features) if drop_features else []
+        
+        if not target_col:
+            numeric_cols = [c for c, val in columns_json.items() if val["type"] == "numerical"]
+            if numeric_cols:
+                target_col = numeric_cols[-1]
+            else:
+                target_col = list(columns_json.keys())[0]
+                
+        if not parsed_features:
+            parsed_features = [c for c in columns_json.keys() if c != target_col and c not in parsed_drops]
+            
+        # Create pipeline run
+        run_id = create_pipeline_run(dataset_id)
+        
+        # Construct dataset dict matching DB schema
+        dataset = {
+            "id": dataset_id,
+            "file_name": file.filename,
+            "row_count": row_count,
+            "columns_json": columns_json
+        }
+        
+        # Execute the pipeline synchronously
+        await run_pipeline_orchestrator(
+            run_id=run_id,
+            dataset=dataset,
+            dataset_path=file_path,
+            target_col=target_col,
+            features=parsed_features,
+            k_clusters=k_clusters,
+            drop_features=parsed_drops
+        )
+        
+        # Retrieve run details
+        run_details = get_run_details(run_id)
+        
+        # Extract writer insights
+        markdown_report = ""
+        logs = run_details.get("logs", [])
+        writer_log = next((l for l in logs if l["agent_name"] == "writer"), None)
+        if writer_log:
+            markdown_report = writer_log.get("model_response", "")
+            
+        return {
+            "metrics": run_details.get("final_metrics", {}),
+            "logs": logs,
+            "markdown_report": markdown_report
         }
     except Exception as e:
         if os.path.exists(file_path):
@@ -216,333 +336,352 @@ async def run_pipeline_orchestrator(
     run_id: str, dataset: dict, dataset_path: str, target_col: str, 
     features: list, k_clusters: int, drop_features: list
 ):
-    # Setup initial state variables in in-memory session service
-    session_state = in_memory_session_service.get_session(run_id)
-    session_state["dropped_features"] = list(drop_features)
-    
-    self_correction_count = 0
-    max_self_correction = 3
-    final_metrics = {}
-    judge_approved = False
-    judge_critique = "No evaluation performed."
-    
-    cleaned_persistent_path = os.path.join(UPLOAD_DIR, f"cleaned_{run_id}.csv")
-    
-    # ------------------ STEP 1: DATA PREPARATION ------------------
-    update_pipeline_status(run_id, "cleaning")
-    await manager.send_json(run_id, {
-        "type": "state_update",
-        "step": "data_prep",
-        "status": "active",
-        "message": "Data Prep Agent: Generating data cleaning and normalization script..."
-    })
-    
-    # Generate cleaning code
-    data_prep_res = run_data_prep_agent(
-        dataset["file_name"], dataset["row_count"], dataset["columns_json"], session_state["dropped_features"]
-    )
-    
-    # Log agent interaction
-    add_agent_log(run_id, "data_prep", f"Clean columns using drops: {session_state['dropped_features']}", data_prep_res.explanation, data_prep_res.code)
-    
-    await manager.send_json(run_id, {
-        "type": "agent_message",
-        "agent": "data_prep",
-        "explanation": data_prep_res.explanation,
-        "code": data_prep_res.code
-    })
-    
-    # Run generated code
-    await manager.send_json(run_id, {"type": "state_update", "step": "data_prep", "status": "running", "message": "Executing data prep script..."})
-    exec_res = execute_code(
-        data_prep_res.code, 
-        dataset_path,
-        output_files={"cleaned_dataset.csv": cleaned_persistent_path}
-    )
-    
-    # Stream terminal logs
-    await manager.send_json(run_id, {
-        "type": "terminal_logs",
-        "stdout": exec_res["stdout"],
-        "stderr": exec_res["stderr"]
-    })
-    
-    if not exec_res["success"]:
-        update_pipeline_status(run_id, "failed")
-        await manager.send_json(run_id, {"type": "state_update", "step": "data_prep", "status": "failed", "message": "Data Prep execution failed. Stopping pipeline."})
-        return
+    try:
+        # Setup initial state variables in in-memory session service
+        session_state = in_memory_session_service.get_session(run_id)
+        session_state["dropped_features"] = list(drop_features)
         
-    await manager.send_json(run_id, {"type": "state_update", "step": "data_prep", "status": "success", "message": "Data Prep completed successfully."})
-    
-    # ------------------ STEP 2: ML MODELING & DUAL-STAGE SELF-CORRECTION LOOP ------------------
-    update_pipeline_status(run_id, "modeling")
-    
-    last_modeling_code = ""
-    last_modeling_explanation = ""
-    
-    while self_correction_count < max_self_correction:
-        # Decrement temperature slightly for progressive runs
-        current_temp = max(0.0, 0.1 - 0.04 * self_correction_count)
-        session_state["temperature"] = current_temp
+        self_correction_count = 0
+        max_self_correction = 3
+        final_metrics = {}
+        judge_approved = False
+        judge_critique = "No evaluation performed."
         
+        cleaned_persistent_path = os.path.join(UPLOAD_DIR, f"cleaned_{run_id}.csv")
+        
+        # ------------------ STEP 1: DATA PREPARATION ------------------
+        update_pipeline_status(run_id, "cleaning")
         await manager.send_json(run_id, {
             "type": "state_update",
-            "step": "ml_modeler",
+            "step": "data_prep",
             "status": "active",
-            "message": f"ML Modeler Agent: Writing modeling script (Attempt {self_correction_count + 1}, Temp: {current_temp:.2f})..."
+            "message": "Data Prep Agent: Generating data cleaning and normalization script..."
         })
         
-        # Run modeler with active session parameters
-        modeling_res = run_ml_modeling_agent(
-            features, 
-            target_col, 
-            k_clusters, 
-            session_state["dropped_features"], 
-            temperature=current_temp,
-            refinement_prompt=session_state["refinement_prompt"]
+        # Generate cleaning code
+        data_prep_res = run_data_prep_agent(
+            dataset["file_name"], dataset["row_count"], dataset["columns_json"], session_state["dropped_features"]
         )
         
-        last_modeling_code = modeling_res.code
-        last_modeling_explanation = modeling_res.explanation
-        
-        add_agent_log(
-            run_id, "ml_modeler", 
-            f"Model config: features={features}, target={target_col}, k={k_clusters}, drops={session_state['dropped_features']}, temp={current_temp}, refinement={session_state['refinement_prompt']}", 
-            modeling_res.explanation, modeling_res.code
-        )
+        # Log agent interaction
+        add_agent_log(run_id, "data_prep", f"Clean columns using drops: {session_state['dropped_features']}", data_prep_res.explanation, data_prep_res.code)
         
         await manager.send_json(run_id, {
             "type": "agent_message",
-            "agent": "ml_modeler",
-            "explanation": modeling_res.explanation,
-            "code": modeling_res.code
+            "agent": "data_prep",
+            "explanation": data_prep_res.explanation,
+            "code": data_prep_res.code
         })
         
-        # Execute modeling script
-        await manager.send_json(run_id, {"type": "state_update", "step": "ml_modeler", "status": "running", "message": "Running ML modeling code..."})
+        # Run generated code
+        await manager.send_json(run_id, {"type": "state_update", "step": "data_prep", "status": "running", "message": "Executing data prep script..."})
         exec_res = execute_code(
-            modeling_res.code, 
-            dataset_path, 
-            additional_inputs={"cleaned_dataset.csv": cleaned_persistent_path}
+            data_prep_res.code, 
+            dataset_path,
+            output_files={"cleaned_dataset.csv": cleaned_persistent_path}
         )
         
-        # Send terminal outputs
+        # Stream terminal logs
         await manager.send_json(run_id, {
             "type": "terminal_logs",
             "stdout": exec_res["stdout"],
             "stderr": exec_res["stderr"]
         })
         
-        # Send plots if any
-        if exec_res.get("plots"):
-            await manager.send_json(run_id, {
-                "type": "plots",
-                "plots": exec_res["plots"]
-            })
-            
-        metrics = exec_res.get("metrics", {})
-        
-        # Log trajectory evaluation in Supabase agent_logs
-        trajectory_raw_prompt = json.dumps(dataset["columns_json"])
-        trajectory_model_response = json.dumps({
-            "stdout": exec_res["stdout"],
-            "stderr": exec_res["stderr"],
-            "metrics": metrics,
-            "success": exec_res["success"],
-            "iteration": self_correction_count
-        })
-        add_agent_log(
-            run_id,
-            "trajectory_evaluation",
-            trajectory_raw_prompt,
-            trajectory_model_response,
-            modeling_res.code
-        )
-        
-        # Store iteration results in state session service
-        session_state["iterations"].append({
-            "iteration_index": self_correction_count,
-            "metrics": metrics,
-            "code": modeling_res.code,
-            "explanation": modeling_res.explanation,
-            "stdout": exec_res["stdout"],
-            "stderr": exec_res["stderr"],
-            "plots": exec_res.get("plots", []),
-            "success": exec_res["success"]
-        })
-        
-        # Progressive disclosure layer: Context-compact memory to retain only final metrics/schema and discard old code scripts
-        if len(session_state["iterations"]) > 1:
-            for old_it in session_state["iterations"][:-1]:
-                old_it["code"] = "[Archived to Supabase Logs]"
-                old_it["stdout"] = "[Archived to Supabase Logs]"
-                old_it["stderr"] = "[Archived to Supabase Logs]"
-        
-        # STAGE 1: Code Safety & Syntax checks
         if not exec_res["success"]:
-            tb = exec_res["stderr"] or exec_res["stdout"] or "Unknown execution error."
+            update_pipeline_status(run_id, "failed")
+            await manager.send_json(run_id, {"type": "state_update", "step": "data_prep", "status": "failed", "message": "Data Prep execution failed. Stopping pipeline."})
+            return
+            
+        await manager.send_json(run_id, {"type": "state_update", "step": "data_prep", "status": "success", "message": "Data Prep completed successfully."})
+        
+        # ------------------ STEP 2: ML MODELING & DUAL-STAGE SELF-CORRECTION LOOP ------------------
+        update_pipeline_status(run_id, "modeling")
+        
+        last_modeling_code = ""
+        last_modeling_explanation = ""
+        
+        while self_correction_count < max_self_correction:
+            # Decrement temperature slightly for progressive runs
+            current_temp = max(0.0, 0.1 - 0.04 * self_correction_count)
+            session_state["temperature"] = current_temp
+            
             await manager.send_json(run_id, {
-                "type": "state_update", 
-                "step": "ml_modeler", 
-                "status": "failed", 
-                "message": "Stage 1: Syntax failure detected! Preparing progressive refinement feedback..."
+                "type": "state_update",
+                "step": "ml_modeler",
+                "status": "active",
+                "message": f"ML Modeler Agent: Writing modeling script (Attempt {self_correction_count + 1}, Temp: {current_temp:.2f})..."
             })
             
-            # Formulate progressive refinement traceback prompt
-            session_state["refinement_prompt"] = f"""
+            # Run modeler with active session parameters
+            modeling_res = run_ml_modeling_agent(
+                features, 
+                target_col, 
+                k_clusters, 
+                session_state["dropped_features"], 
+                temperature=current_temp,
+                refinement_prompt=session_state["refinement_prompt"]
+            )
+            
+            last_modeling_code = modeling_res.code
+            last_modeling_explanation = modeling_res.explanation
+            
+            add_agent_log(
+                run_id, "ml_modeler", 
+                f"Model config: features={features}, target={target_col}, k={k_clusters}, drops={session_state['dropped_features']}, temp={current_temp}, refinement={session_state['refinement_prompt']}", 
+                modeling_res.explanation, modeling_res.code
+            )
+            
+            await manager.send_json(run_id, {
+                "type": "agent_message",
+                "agent": "ml_modeler",
+                "explanation": modeling_res.explanation,
+                "code": modeling_res.code
+            })
+            
+            # Execute modeling script
+            await manager.send_json(run_id, {"type": "state_update", "step": "ml_modeler", "status": "running", "message": "Running ML modeling code..."})
+            exec_res = execute_code(
+                modeling_res.code, 
+                dataset_path, 
+                additional_inputs={"cleaned_dataset.csv": cleaned_persistent_path}
+            )
+            
+            # Send terminal outputs
+            await manager.send_json(run_id, {
+                "type": "terminal_logs",
+                "stdout": exec_res["stdout"],
+                "stderr": exec_res["stderr"]
+            })
+            
+            # Send plots if any
+            if exec_res.get("plots"):
+                await manager.send_json(run_id, {
+                    "type": "plots",
+                    "plots": exec_res["plots"]
+                })
+                
+            metrics = sanitize_json_payload(exec_res.get("metrics", {}))
+            
+            # Log trajectory evaluation in Supabase agent_logs
+            trajectory_raw_prompt = json.dumps(dataset["columns_json"])
+            trajectory_model_response = json.dumps({
+                "stdout": exec_res["stdout"],
+                "stderr": exec_res["stderr"],
+                "metrics": metrics,
+                "success": exec_res["success"],
+                "iteration": self_correction_count
+            })
+            add_agent_log(
+                run_id,
+                "trajectory_evaluation",
+                trajectory_raw_prompt,
+                trajectory_model_response,
+                modeling_res.code
+            )
+            
+            # Store iteration results in state session service
+            session_state["iterations"].append({
+                "iteration_index": self_correction_count,
+                "metrics": metrics,
+                "code": modeling_res.code,
+                "explanation": modeling_res.explanation,
+                "stdout": exec_res["stdout"],
+                "stderr": exec_res["stderr"],
+                "plots": exec_res.get("plots", []),
+                "success": exec_res["success"]
+            })
+            
+            # Progressive disclosure layer: Context-compact memory to retain only final metrics/schema and discard old code scripts
+            if len(session_state["iterations"]) > 1:
+                for old_it in session_state["iterations"][:-1]:
+                    old_it["code"] = "[Archived to Supabase Logs]"
+                    old_it["stdout"] = "[Archived to Supabase Logs]"
+                    old_it["stderr"] = "[Archived to Supabase Logs]"
+            
+            # STAGE 1: Code Safety & Syntax checks
+            if not exec_res["success"]:
+                tb = exec_res["stderr"] or exec_res["stdout"] or "Unknown execution error."
+                await manager.send_json(run_id, {
+                    "type": "state_update", 
+                    "step": "ml_modeler", 
+                    "status": "failed", 
+                    "message": "Stage 1: Syntax failure detected! Preparing progressive refinement feedback..."
+                })
+                
+                # Formulate progressive refinement traceback prompt
+                session_state["refinement_prompt"] = f"""
 The previous Python modeling script failed to execute.
 Traceback error:
 {tb}
 
 Please fix the script to compile safely. Double check imports and variables.
 """
-            self_correction_count += 1
-            continue
-            
-        # STAGE 2: Statistical Boundary Analysis
-        update_pipeline_status(run_id, "validating")
-        await manager.send_json(run_id, {
-            "type": "state_update",
-            "step": "statistical_judge",
-            "status": "active",
-            "message": "Stage 2: Statistical Judge Agent evaluating regression coefficients and VIF boundaries..."
-        })
-        
-        # Invoke LLM-as-a-judge
-        judge_res = run_statistical_judge_agent(metrics, exec_res["stdout"] + exec_res["stderr"], self_correction_count)
-        judge_critique = judge_res.critique
-        judge_approved = judge_res.approved
-        
-        add_agent_log(
-            run_id, "statistical_judge", 
-            f"Metrics: {json.dumps(metrics)}", 
-            judge_res.critique, 
-            json.dumps(judge_res.suggested_overrides)
-        )
-        
-        await manager.send_json(run_id, {
-            "type": "agent_message",
-            "agent": "statistical_judge",
-            "explanation": judge_res.critique,
-            "code": ""
-        })
-        
-        # Check approval
-        r2 = metrics.get("r2", 0.0)
-        vifs = metrics.get("vifs", {})
-        high_vifs = [k for k, v in vifs.items() if v > 5.0]
-        
-        # Overrides suggested by LLM
-        overrides = judge_res.suggested_overrides or {}
-        new_drops = overrides.get("drop_features", [])
-        
-        # Ensure VIF high items are added to drops
-        for hv in high_vifs:
-            if hv not in new_drops:
-                new_drops.append(hv)
+                self_correction_count += 1
+                continue
                 
-        if judge_approved and r2 >= 0.60 and len(high_vifs) == 0:
+            # STAGE 2: Statistical Boundary Analysis
+            update_pipeline_status(run_id, "validating")
             await manager.send_json(run_id, {
                 "type": "state_update",
                 "step": "statistical_judge",
-                "status": "success",
-                "message": f"Stage 2: Model approved! R2={r2:.4f} >= 0.60, Max VIF={max(vifs.values()) if vifs else 1.0:.2f} <= 5.0."
+                "status": "active",
+                "message": "Stage 2: Statistical Judge Agent evaluating regression coefficients and VIF boundaries..."
             })
-            final_metrics = metrics
-            break
-        else:
-            self_correction_count += 1
-            final_metrics = metrics
             
-            # Setup correction settings in session store
-            if new_drops:
-                session_state["dropped_features"].extend([d for d in new_drops if d not in session_state["dropped_features"]])
+            # Invoke LLM-as-a-judge
+            judge_res = run_statistical_judge_agent(metrics, exec_res["stdout"] + exec_res["stderr"], self_correction_count)
+            judge_critique = judge_res.critique
+            judge_approved = judge_res.approved
             
-            if self_correction_count < max_self_correction:
-                # Progressive refinement feedback for statistical issues
-                session_state["refinement_prompt"] = f"""
+            add_agent_log(
+                run_id, "statistical_judge", 
+                f"Metrics: {json.dumps(metrics)}", 
+                judge_res.critique, 
+                json.dumps(judge_res.suggested_overrides)
+            )
+            
+            await manager.send_json(run_id, {
+                "type": "agent_message",
+                "agent": "statistical_judge",
+                "explanation": judge_res.critique,
+                "code": ""
+            })
+            
+            # Check approval
+            r2 = metrics.get("r2", 0.0)
+            vifs = metrics.get("vifs", {})
+            high_vifs = [k for k, v in vifs.items() if v > 5.0]
+            
+            # Overrides suggested by LLM
+            overrides = judge_res.suggested_overrides or {}
+            new_drops = overrides.get("drop_features", [])
+            
+            # Ensure VIF high items are added to drops
+            for hv in high_vifs:
+                if hv not in new_drops:
+                    new_drops.append(hv)
+                    
+            if judge_approved and r2 >= 0.60 and len(high_vifs) == 0:
+                await manager.send_json(run_id, {
+                    "type": "state_update",
+                    "step": "statistical_judge",
+                    "status": "success",
+                    "message": f"Stage 2: Model approved! R2={r2:.4f} >= 0.60, Max VIF={max(vifs.values()) if vifs else 1.0:.2f} <= 5.0."
+                })
+                final_metrics = metrics
+                break
+            else:
+                self_correction_count += 1
+                final_metrics = metrics
+                
+                # Setup correction settings in session store
+                if new_drops:
+                    session_state["dropped_features"].extend([d for d in new_drops if d not in session_state["dropped_features"]])
+                
+                if self_correction_count < max_self_correction:
+                    # Progressive refinement feedback for statistical issues
+                    session_state["refinement_prompt"] = f"""
 The previous modeling script fit was statistically rejected.
 Critique: {judge_critique}
 Action required: Exclude or drop multicollinear features: {new_drops}
 """
+                    await manager.send_json(run_id, {
+                        "type": "state_update",
+                        "step": "self_correction",
+                        "status": "active",
+                        "message": f"Judge rejected model (R2={r2:.3f}, Multicollinear features={new_drops}). Retrying pass {self_correction_count + 1}..."
+                    })
+                else:
+                    await manager.send_json(run_id, {
+                        "type": "state_update",
+                        "step": "statistical_judge",
+                        "status": "failed",
+                        "message": "Stage 2: Statistical boundaries failed. Max loop limit reached."
+                    })
+                    
+        # ------------------ SELECTION OF OPTIMAL MODEL (IF MAXIMUM ATTEMPTS REACHED) ------------------
+        if not judge_approved:
+            # Gracefully select optimal run from iterations history
+            valid_iterations = [it for it in session_state["iterations"] if it["success"]]
+            if valid_iterations:
+                # Optimal model is the one with highest R2 score
+                best_iter = max(valid_iterations, key=lambda x: x["metrics"].get("r2", 0.0))
+                best_idx = best_iter["iteration_index"]
+                best_r2 = best_iter["metrics"].get("r2", 0.0)
+                
+                final_metrics = best_iter["metrics"]
+                last_modeling_code = best_iter["code"]
+                last_modeling_explanation = best_iter["explanation"]
+                
+                system_badge = f"[SYSTEM PERFORMANCE: COMPLETED WITH STATISTICAL WARNINGS - OPTIMAL ITERATION {best_idx + 1} SELECTED (R2={best_r2:.4f})]"
+                
+                judge_critique = f"{system_badge}\n\nMaximum self-correction threshold of 3 runs reached. Statistical boundaries (R2 >= 0.60, VIF <= 5.0) were not fully satisfied in all iterations. Optimal iteration {best_idx + 1} was restored as the final model fit."
+                
                 await manager.send_json(run_id, {
                     "type": "state_update",
                     "step": "self_correction",
-                    "status": "active",
-                    "message": f"Judge rejected model (R2={r2:.3f}, Multicollinear features={new_drops}). Retrying pass {self_correction_count + 1}..."
+                    "status": "success",
+                    "message": f"Restored optimal iteration {best_idx + 1} (R2={best_r2:.3f})."
                 })
             else:
-                await manager.send_json(run_id, {
-                    "type": "state_update",
-                    "step": "statistical_judge",
-                    "status": "failed",
-                    "message": "Stage 2: Statistical boundaries failed. Max loop limit reached."
-                })
+                system_badge = "[SYSTEM PERFORMANCE: PIPELINE FAILED - NO VALID ITERATION EXECUTED]"
+                judge_critique = f"{system_badge}\n\nAll 3 execution attempts encountered syntax or runtime errors. No model could be successfully fitted."
                 
-    # ------------------ SELECTION OF OPTIMAL MODEL (IF MAXIMUM ATTEMPTS REACHED) ------------------
-    if not judge_approved:
-        # Gracefully select optimal run from iterations history
-        valid_iterations = [it for it in session_state["iterations"] if it["success"]]
-        if valid_iterations:
-            # Optimal model is the one with highest R2 score
-            best_iter = max(valid_iterations, key=lambda x: x["metrics"].get("r2", 0.0))
-            best_idx = best_iter["iteration_index"]
-            best_r2 = best_iter["metrics"].get("r2", 0.0)
-            
-            final_metrics = best_iter["metrics"]
-            last_modeling_code = best_iter["code"]
-            last_modeling_explanation = best_iter["explanation"]
-            
-            system_badge = f"[SYSTEM PERFORMANCE: COMPLETED WITH STATISTICAL WARNINGS - OPTIMAL ITERATION {best_idx + 1} SELECTED (R2={best_r2:.4f})]"
-            
-            judge_critique = f"{system_badge}\n\nMaximum self-correction threshold of 3 runs reached. Statistical boundaries (R2 >= 0.60, VIF <= 5.0) were not fully satisfied in all iterations. Optimal iteration {best_idx + 1} was restored as the final model fit."
-            
+        # ------------------ STEP 4: WRITER AGENT (INSIGHT TRANSLATOR) ------------------
+        update_pipeline_status(run_id, "modeling" if self_correction_count >= max_self_correction and not judge_approved and not session_state["iterations"] else "validating")
+        await manager.send_json(run_id, {
+            "type": "state_update",
+            "step": "writer",
+            "status": "active",
+            "message": "Writer Agent: Translating numerical results into business insights markdown..."
+        })
+        
+        # Generate final report using selected metrics
+        writer_res = run_writer_agent(
+            dataset["file_name"], dataset["row_count"], dataset["columns_json"],
+            data_prep_res.explanation, last_modeling_explanation, final_metrics, judge_critique
+        )
+        
+        add_agent_log(
+            run_id, "writer",
+            f"Generate insights report for: {dataset['file_name']}",
+            writer_res.markdown_report,
+            ""
+        )
+        
+        await manager.send_json(run_id, {
+            "type": "agent_message",
+            "agent": "writer",
+            "explanation": writer_res.markdown_report,
+            "code": ""
+        })
+        
+        # Finish pipeline run
+        final_status = "completed" if judge_approved or any(it["success"] for it in session_state["iterations"]) else "failed"
+        update_pipeline_status(run_id, final_status, sanitize_json_payload(final_metrics))
+        
+        await manager.send_json(run_id, {
+            "type": "state_update",
+            "step": "completed",
+            "status": "success" if final_status == "completed" else "failed",
+            "message": f"Pipeline execution completed with status: {final_status.upper()}"
+        })
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        print(f"Orchestration pipeline exception: {tb}")
+        try:
+            update_pipeline_status(run_id, "failed", {})
             await manager.send_json(run_id, {
                 "type": "state_update",
-                "step": "self_correction",
-                "status": "success",
-                "message": f"Restored optimal iteration {best_idx + 1} (R2={best_r2:.3f})."
+                "step": "failed",
+                "status": "failed",
+                "message": f"Pipeline crashed during execution: {str(e)}"
             })
-        else:
-            system_badge = "[SYSTEM PERFORMANCE: PIPELINE FAILED - NO VALID ITERATION EXECUTED]"
-            judge_critique = f"{system_badge}\n\nAll 3 execution attempts encountered syntax or runtime errors. No model could be successfully fitted."
-            
-    # ------------------ STEP 4: WRITER AGENT (INSIGHT TRANSLATOR) ------------------
-    update_pipeline_status(run_id, "modeling" if self_correction_count >= max_self_correction and not judge_approved and not session_state["iterations"] else "validating")
-    await manager.send_json(run_id, {
-        "type": "state_update",
-        "step": "writer",
-        "status": "active",
-        "message": "Writer Agent: Translating numerical results into business insights markdown..."
-    })
-    
-    # Generate final report using selected metrics
-    writer_res = run_writer_agent(
-        dataset["file_name"], dataset["row_count"], dataset["columns_json"],
-        data_prep_res.explanation, last_modeling_explanation, final_metrics, judge_critique
-    )
-    
-    add_agent_log(
-        run_id, "writer",
-        f"Generate insights report for: {dataset['file_name']}",
-        writer_res.markdown_report,
-        ""
-    )
-    
-    await manager.send_json(run_id, {
-        "type": "agent_message",
-        "agent": "writer",
-        "explanation": writer_res.markdown_report,
-        "code": ""
-    })
-    
-    # Finish pipeline run
-    final_status = "completed" if judge_approved or any(it["success"] for it in session_state["iterations"]) else "failed"
-    update_pipeline_status(run_id, final_status, final_metrics)
-    
-    await manager.send_json(run_id, {
-        "type": "state_update",
-        "step": "completed",
-        "status": "success" if final_status == "completed" else "failed",
-        "message": f"Pipeline execution completed with status: {final_status.upper()}"
-    })
+            await manager.send_json(run_id, {
+                "type": "error",
+                "message": f"Orchestrator failure: {str(e)}"
+            })
+        except:
+            pass
