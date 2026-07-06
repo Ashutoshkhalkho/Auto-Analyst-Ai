@@ -11,7 +11,19 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 # Check if we should use Supabase or SQLite
-USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_KEY)
+USE_SUPABASE = False
+if SUPABASE_URL and SUPABASE_KEY:
+    import httpx
+    try:
+        # Perform a quick reachability check to Supabase with a 3.0s timeout
+        with httpx.Client(timeout=3.0) as client:
+            response = client.get(SUPABASE_URL)
+            if response.status_code in (200, 401, 403, 404): # Any response from server means it is reachable
+                USE_SUPABASE = True
+            else:
+                print(f"Supabase returned status {response.status_code}. Falling back to SQLite.")
+    except Exception as e:
+        print(f"Supabase connection check failed: {e}. Falling back to SQLite.")
 
 # If SQLite fallback is active, import SQLAlchemy dependencies
 if not USE_SUPABASE:

@@ -388,7 +388,7 @@ def run_data_prep_agent(file_name: str, row_count: int, columns_info: dict, drop
     1. Read 'dataset.csv' into a pandas DataFrame: `df = pd.read_csv("dataset.csv")`.
     2. Drop any columns requested in the features to drop manually.
     3. Identify and handle dirty numerical columns: For any categorical/object columns that contain mostly numeric values (e.g. Age with 'N/A' or purchase_amount with 'abc'), coerce them using `pd.to_numeric(df[col], errors='coerce')` so they can be processed numerically.
-    4. Impute missing values (fill missing numerical values with their median, and categorical values with their mode or a separate 'missing' category).
+    4. Impute missing values (fill missing numerical values with their median, and categorical values with their mode or a separate 'missing' category). VERY IMPORTANT: Do NOT use `inplace=True` for pandas operations (such as `.fillna()`, `.dropna()`, or `.replace()`), as modern pandas versions do not support inplace modifications on column slices/views reliably. Always use explicit assignment (e.g., `df[col] = df[col].fillna(...)`).
     5. Clean outliers in numerical columns by clipping them to the 1st and 99th percentiles.
     6. Apply `sklearn.preprocessing.StandardScaler` to scale all numerical columns except any identified ID/target columns, keeping column headers.
     7. Save the final cleaned dataframe to 'cleaned_dataset.csv' via `df.to_csv("cleaned_dataset.csv", index=False)`.

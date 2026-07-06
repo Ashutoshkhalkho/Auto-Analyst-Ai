@@ -198,8 +198,16 @@ export default function App() {
         throw new Error(errorData.detail || 'Upload failed');
       }
       
-      const newDataset = await res.json();
+      const uploadResult = await res.json();
       await fetchDatasets();
+      
+      const newDataset = {
+        id: uploadResult.dataset_id,
+        file_name: uploadResult.file_name,
+        row_count: uploadResult.row_count,
+        columns_json: uploadResult.columns
+      };
+      
       handleSelectDataset(newDataset);
       setActiveTab('dashboard');
     } catch (err) {
