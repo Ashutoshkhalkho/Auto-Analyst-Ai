@@ -45,10 +45,9 @@ export default function Dashboard() {
   const terminalEndRef = useRef(null);
   const wsRef = useRef(null);
 
-  // Use relative endpoint in production (Vercel) to avoid CORS violations, fallback to env or localhost for dev.
-  const API_URL = typeof window !== "undefined" && window.location.hostname !== "localhost"
-    ? ""
-    : (process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000");
+  // Environment-driven API base URL (NEXT_PUBLIC_API_URL in production, fallback to http://localhost:8000 in dev)
+  const rawApiUrl = (process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000").trim();
+  const API_URL = rawApiUrl.replace(/\/+$/, "");
 
   // Sync DB records on startup
   const [dbStatus, setDbStatus] = useState("connecting");
@@ -164,15 +163,12 @@ export default function Dashboard() {
     let wsProtocol = "ws";
     let wsHost = "localhost:8000";
 
-    if (typeof window !== "undefined") {
-      wsProtocol = window.location.protocol === "https:" ? "wss" : "ws";
-      wsHost = window.location.host;
-    }
-
-    // Override if API_URL is absolute
     if (API_URL && API_URL.startsWith("http")) {
       wsProtocol = API_URL.startsWith("https") ? "wss" : "ws";
-      wsHost = API_URL.replace("http://", "").replace("https://", "");
+      wsHost = API_URL.replace(/^https?:\/\//, "").replace(/\/+$/, "");
+    } else if (typeof window !== "undefined") {
+      wsProtocol = window.location.protocol === "https:" ? "wss" : "ws";
+      wsHost = window.location.host;
     }
 
     const ws = new WebSocket(`${wsProtocol}://${wsHost}/ws/pipeline/${id}`);
