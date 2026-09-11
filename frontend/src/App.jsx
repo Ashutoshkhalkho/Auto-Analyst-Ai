@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { API_BASE_URL, getWsUrl } from './config';
 import { 
   LayoutDashboard, 
   UploadCloud, 
@@ -105,7 +106,7 @@ export default function App() {
 
   const fetchHealth = async () => {
     try {
-      const res = await fetch('/api/health');
+      const res = await fetch(`${API_BASE_URL}/api/health`);
       const data = await res.json();
       setMetrics(prev => ({
         ...prev,
@@ -118,7 +119,7 @@ export default function App() {
 
   const fetchDatasets = async () => {
     try {
-      const res = await fetch('/api/datasets');
+      const res = await fetch(`${API_BASE_URL}/api/datasets`);
       const data = await res.json();
       setDatasets(data);
       if (data.length > 0 && !selectedDataset) {
@@ -131,7 +132,7 @@ export default function App() {
 
   const fetchRuns = async () => {
     try {
-      const res = await fetch('/api/runs');
+      const res = await fetch(`${API_BASE_URL}/api/runs`);
       const data = await res.json();
       setPipelineRuns(data);
       
@@ -189,7 +190,7 @@ export default function App() {
     formData.append('file', file);
     
     try {
-      const res = await fetch('/api/upload', {
+      const res = await fetch(`${API_BASE_URL}/api/upload`, {
         method: 'POST',
         body: formData
       });
@@ -246,7 +247,7 @@ export default function App() {
     };
     
     try {
-      const res = await fetch('/api/start-pipeline', {
+      const res = await fetch(`${API_BASE_URL}/api/start-pipeline`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(requestData)
@@ -260,8 +261,7 @@ export default function App() {
       setRunStatus('running');
       setActiveTab('dashboard');
       
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}/ws/pipeline/${runId}`;
+      const wsUrl = getWsUrl(runId);
       const ws = new WebSocket(wsUrl);
       socketRef.current = ws;
       
@@ -333,7 +333,7 @@ export default function App() {
 
   const handleSelectArchiveRun = async (runId) => {
     try {
-      const res = await fetch(`/api/runs/${runId}`);
+      const res = await fetch(`${API_BASE_URL}/api/runs/${runId}`);
       const data = await res.json();
       setSelectedArchiveRun(data);
     } catch (e) {

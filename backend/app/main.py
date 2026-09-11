@@ -49,10 +49,16 @@ init_db()
 
 app = FastAPI(title="Auto-Analyst AI API")
 
-# Enable CORS for frontend development
+# Configure CORS (Environment Driven for Production Security)
+raw_cors = os.getenv("CORS_ORIGINS", "*")
+if raw_cors.strip() == "*":
+    origins = ["*"]
+else:
+    origins = [o.strip() for o in raw_cors.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

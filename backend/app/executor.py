@@ -141,6 +141,13 @@ plt.show = _intercepted_show
         python_exe = sys.executable
         if not python_exe:
             python_exe = "python"
+
+        # Sanitize environment variables to isolate subprocess from app secrets
+        sensitive_keys = {
+            "GEMINI_API_KEY", "SUPABASE_KEY", "SUPABASE_URL", "DATABASE_URL",
+            "SECRET_KEY", "JWT_SECRET", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"
+        }
+        sanitized_env = {k: v for k, v in os.environ.items() if k not in sensitive_keys}
             
         # Run script
         process = subprocess.run(
@@ -149,7 +156,8 @@ plt.show = _intercepted_show
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=30 # 30 seconds limit
+            timeout=30, # 30 seconds limit
+            env=sanitized_env
         )
         
         stdout = process.stdout
