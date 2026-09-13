@@ -49,16 +49,31 @@ init_db()
 
 app = FastAPI(title="Auto-Analyst AI API")
 
-# Configure CORS (Environment Driven for Production Security)
-raw_cors = os.getenv("CORS_ORIGINS", "*")
-if raw_cors.strip() == "*":
-    origins = ["*"]
+# Configure CORS for Production (Vercel) and Local Development
+default_origins = [
+    "https://auto-analyst-dfh34l7u-ashutoshkhalkhos-projects.vercel.app",
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "http://localhost:8000",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:8000",
+]
+
+env_cors = os.getenv("CORS_ORIGINS", "").strip()
+if env_cors:
+    if env_cors == "*":
+        cors_origins = ["*"]
+    else:
+        extra_origins = [o.strip() for o in env_cors.split(",") if o.strip()]
+        cors_origins = list(dict.fromkeys(default_origins + extra_origins))
 else:
-    origins = [o.strip() for o in raw_cors.split(",") if o.strip()]
+    cors_origins = default_origins
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=cors_origins,
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
